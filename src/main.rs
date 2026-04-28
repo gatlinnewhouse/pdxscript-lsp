@@ -1,4 +1,6 @@
 mod backend;
+mod completions;
+mod demorgan;
 mod gamedir;
 mod validate;
 

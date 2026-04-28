@@ -9,7 +9,11 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use anyhow::Result;
-use tiger_lib::{Everything, ModMetadata, Severity, take_reports};
+#[cfg(any(feature = "vic3", feature = "eu5"))]
+use tiger_lib::ModMetadata;
+#[cfg(any(feature = "ck3", feature = "imperator", feature = "hoi4"))]
+use tiger_lib::ModFile;
+use tiger_lib::{Everything, Severity, take_reports};
 use tower_lsp::lsp_types::{
     Diagnostic, DiagnosticSeverity, NumberOrString, Position, Range, Url,
 };
@@ -38,16 +42,44 @@ pub fn validate_mod(mod_root: &Path, cfg: &ValidateConfig) -> Result<DiagMap> {
         .lock()
         .unwrap_or_else(|e| e.into_inner());
 
-    let metadata = ModMetadata::read(mod_root)?;
+    // vic3 and eu5 use a metadata folder; ck3/imperator/hoi4 use a .mod file.
+    #[cfg(any(feature = "vic3", feature = "eu5"))]
+    let mut everything = {
+        let metadata = ModMetadata::read(mod_root)?;
+        Everything::new(
+            cfg.config_file.as_deref(),
+            Some(&cfg.game_dir),
+            cfg.workshop_dir.as_deref(),
+            cfg.paradox_dir.as_deref(),
+            mod_root,
+            metadata.replace_paths(),
+        )?
+    };
 
-    let mut everything = Everything::new(
-        cfg.config_file.as_deref(),
-        Some(&cfg.game_dir),
-        cfg.workshop_dir.as_deref(),
-        cfg.paradox_dir.as_deref(),
-        mod_root,
-        metadata.replace_paths(),
-    )?;
+    #[cfg(any(feature = "ck3", feature = "imperator", feature = "hoi4"))]
+    let mut everything = {
+        // Look for descriptor.mod in mod_root, or a .mod file next to it.
+        let mod_file_path = if mod_root.join("descriptor.mod").exists() {
+            mod_root.join("descriptor.mod")
+        } else {
+            // Try one level up for a .mod file matching the directory name
+            let parent = mod_root.parent().unwrap_or(mod_root);
+            let stem = mod_root.file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("mod");
+            let candidate = parent.join(format!("{stem}.mod"));
+            if candidate.exists() { candidate } else { mod_root.join("descriptor.mod") }
+        };
+        let modfile = ModFile::read(&mod_file_path)?;
+        Everything::new(
+            cfg.config_file.as_deref(),
+            Some(&cfg.game_dir),
+            cfg.workshop_dir.as_deref(),
+            cfg.paradox_dir.as_deref(),
+            &modfile.modpath(),
+            modfile.replace_paths(),
+        )?
+    };
 
     everything.load_output_settings(false);
     everything.load_config_filtering_rules();
@@ -74,7 +106,7 @@ pub fn validate_mod(mod_root: &Path, cfg: &ValidateConfig) -> Result<DiagMap> {
 
             let range = loc_to_range(primary.loc.line, primary.loc.column, primary.length);
 
-            let mut message = meta.msg.clone();
+            let mut message = format!("[{}] {}", meta.key, meta.msg);
             if let Some(info) = &meta.info {
                 message.push('\n');
                 message.push_str(info);

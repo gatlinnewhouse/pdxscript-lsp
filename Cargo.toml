@@ -7,8 +7,36 @@ license = "GPL-3.0-or-later"
 rust-version = "1.88"
 
 [[bin]]
-name = "pdxscript-lsp"
+name = "pdxscript-lsp-vic3"
 path = "src/main.rs"
+required-features = ["vic3"]
+
+[[bin]]
+name = "pdxscript-lsp-ck3"
+path = "src/main.rs"
+required-features = ["ck3"]
+
+[[bin]]
+name = "pdxscript-lsp-imperator"
+path = "src/main.rs"
+required-features = ["imperator"]
+
+[[bin]]
+name = "pdxscript-lsp-hoi4"
+path = "src/main.rs"
+required-features = ["hoi4"]
+
+[[bin]]
+name = "pdxscript-lsp-eu5"
+path = "src/main.rs"
+required-features = ["eu5"]
+
+[features]
+vic3       = ["tiger-lib/vic3"]
+ck3        = ["tiger-lib/ck3"]
+imperator  = ["tiger-lib/imperator"]
+hoi4       = ["tiger-lib/hoi4"]
+eu5        = ["tiger-lib/eu5"]
 
 [dependencies]
 tower-lsp = "0.20"
@@ -23,4 +51,4 @@ url = "2"
 steamlocate = "2.0"
 home = "0.5"
 
-tiger-lib = { path = "../tiger", version = "1.17.0", default-features = false, features = ["vic3"] }
+tiger-lib = { path = "../tiger", version = "1.17.0", default-features = false }
