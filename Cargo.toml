@@ -32,11 +32,11 @@ path = "src/main.rs"
 required-features = ["eu5"]
 
 [features]
-vic3       = ["tiger-lib/vic3"]
-ck3        = ["tiger-lib/ck3"]
-imperator  = ["tiger-lib/imperator"]
-hoi4       = ["tiger-lib/hoi4"]
-eu5        = ["tiger-lib/eu5"]
+vic3 = ["tiger-lib/vic3"]
+ck3 = ["tiger-lib/ck3"]
+imperator = ["tiger-lib/imperator"]
+hoi4 = ["tiger-lib/hoi4"]
+eu5 = ["tiger-lib/eu5"]
 
 [dependencies]
 tower-lsp = "0.20"
@@ -51,4 +51,4 @@ url = "2"
 steamlocate = "2.0"
 home = "0.5"
 
-tiger-lib = { path = "../tiger", version = "1.17.0", default-features = false }
+tiger-lib = { git = "https://github.com/gatlinnewhouse/tiger", branch = "lsp_wip", default-features = false }
