@@ -1,8 +1,14 @@
 mod backend;
 mod completions;
 mod demorgan;
+mod fold;
+mod format;
 mod gamedir;
+mod hover;
+mod references;
+mod symbols;
 mod validate;
+mod wiki;
 
 use tower_lsp::{LspService, Server};
 use tracing_subscriber::EnvFilter;

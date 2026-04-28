@@ -9,9 +9,20 @@ use tower_lsp::jsonrpc::Result as LspResult;
 use tower_lsp::lsp_types::*;
 use tower_lsp::{Client, LanguageServer};
 
-use crate::completions::{builtin_completions, scan_mod_items, static_keywords, variable_completions};
+use crate::completions::{
+    builtin_completions, scan_mod_items, static_keywords, variable_completions,
+};
 use crate::demorgan::{find_violations, violation_to_action, violations_to_diagnostics};
-use crate::gamedir::{TIGER_CONF, find_game_directory_steam, find_paradox_directory, find_workshop_directory_steam};
+use crate::fold::folding_ranges;
+use crate::format::format_document;
+use crate::gamedir::{
+    TIGER_CONF, find_game_directory_steam, find_paradox_directory, find_workshop_directory_steam,
+};
+use crate::hover::{hover_builtin, hover_scripted, hover_variable};
+use crate::references::{find_references, rename_edit};
+use crate::symbols::{
+    defs_to_locations, document_symbols, top_level_key, word_at, workspace_symbols,
+};
 use crate::validate::{DiagMap, ValidateConfig, validate_mod};
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -28,8 +39,11 @@ pub struct Backend {
     validation_semaphore: tokio::sync::Semaphore,
     published: Mutex<HashMap<Url, Vec<Diagnostic>>>,
     documents: RwLock<HashMap<Url, String>>,
-    /// Tier 3 completions per mod root, refreshed after each validation run.
+    /// Completion items per mod root (tier 3).
     mod_completions: RwLock<HashMap<PathBuf, Vec<CompletionItem>>>,
+    /// Definition locations + detail for scripted items per mod root.
+    /// Value: (Location, detail_str) where detail is "scripted_effect", "event", etc.
+    mod_definitions: RwLock<HashMap<PathBuf, HashMap<String, (Location, String)>>>,
 }
 
 impl Backend {
@@ -41,6 +55,7 @@ impl Backend {
             published: Mutex::new(HashMap::new()),
             documents: RwLock::new(HashMap::new()),
             mod_completions: RwLock::new(HashMap::new()),
+            mod_definitions: RwLock::new(HashMap::new()),
         }
     }
 
@@ -52,7 +67,7 @@ impl Backend {
             match find_game_directory_steam() {
                 Ok(p) => p,
                 Err(e) => {
-                    tracing::warn!("Cannot locate Victoria 3 via Steam: {e}");
+                    tracing::warn!("Cannot locate game via Steam: {e}");
                     return None;
                 }
             }
@@ -79,11 +94,17 @@ impl Backend {
     async fn run_validation(&self, file_uri: &Url) {
         let path = match file_uri.to_file_path() {
             Ok(p) => p,
-            Err(()) => { tracing::warn!("Cannot convert URI to path: {file_uri}"); return; }
+            Err(()) => {
+                tracing::warn!("Cannot convert URI to path: {file_uri}");
+                return;
+            }
         };
         let mod_root = match Self::find_mod_root(&path) {
             Some(r) => r,
-            None => { tracing::debug!("No mod root found for {}", path.display()); return; }
+            None => {
+                tracing::debug!("No mod root found for {}", path.display());
+                return;
+            }
         };
         let cfg = match self.build_validate_config().await {
             Some(c) => c,
@@ -96,31 +117,42 @@ impl Backend {
         };
 
         let mod_root_clone = mod_root.clone();
-        let result = tokio::task::spawn_blocking(move || validate_mod(&mod_root_clone, &cfg)).await;
+        let result =
+            tokio::task::spawn_blocking(move || validate_mod(&mod_root_clone, &cfg)).await;
 
         match result {
             Ok(Ok(diag_map)) => {
                 self.publish_tiger_diagnostics(diag_map).await;
-                // Refresh tier-3 completions after each successful validation.
-                self.refresh_mod_completions(mod_root).await;
+                self.refresh_mod_index(mod_root).await;
             }
             Ok(Err(e)) => {
                 tracing::error!("Validation failed for {}: {e:#}", mod_root.display());
-                self.client.show_message(MessageType::ERROR, format!("pdxscript-lsp: {e}")).await;
+                self.client
+                    .show_message(MessageType::ERROR, format!("pdxscript-lsp: {e}"))
+                    .await;
             }
             Err(e) => tracing::error!("spawn_blocking panicked: {e}"),
         }
     }
 
-    async fn refresh_mod_completions(&self, mod_root: PathBuf) {
+    async fn refresh_mod_index(&self, mod_root: PathBuf) {
         let root_clone = mod_root.clone();
-        let game_dir = self.build_validate_config().await.map(|c| c.game_dir);
-        let items = tokio::task::spawn_blocking(move || {
-            scan_mod_items(&root_clone, game_dir.as_deref()).into_completion_items()
+        let cfg = self.build_validate_config().await;
+        let game_dir = cfg.as_ref().map(|c| c.game_dir.clone());
+        let workshop_dir = cfg.as_ref().and_then(|c| c.workshop_dir.clone());
+
+        let scan = tokio::task::spawn_blocking(move || {
+            scan_mod_items(&root_clone, game_dir.as_deref(), workshop_dir.as_deref())
         })
         .await
         .unwrap_or_default();
-        self.mod_completions.write().await.insert(mod_root, items);
+
+        let raw_defs = scan.definitions.clone();
+        let completions = scan.into_completion_items();
+        let definitions = defs_to_locations(raw_defs);
+
+        self.mod_completions.write().await.insert(mod_root.clone(), completions);
+        self.mod_definitions.write().await.insert(mod_root, definitions);
     }
 
     async fn publish_tiger_diagnostics(&self, mut new_map: DiagMap) {
@@ -149,13 +181,113 @@ impl Backend {
         if let Some(existing) = self.published.lock().await.get(uri) {
             let tiger: Vec<_> = existing
                 .iter()
-                .filter(|d| d.code != Some(NumberOrString::String("de-morgan".to_owned())))
+                .filter(|d| {
+                    d.code != Some(NumberOrString::String("de-morgan".to_owned()))
+                })
                 .cloned()
                 .collect();
             diags.extend(tiger);
         }
         self.client.publish_diagnostics(uri.clone(), diags, None).await;
     }
+
+    /// Resolve the word under the cursor to a (Location, detail) pair.
+    fn resolve_word<'a>(
+        word: &str,
+        definitions: &'a HashMap<String, (Location, String)>,
+    ) -> Option<&'a (Location, String)> {
+        definitions.get(word)
+    }
+
+    /// Collect all mod search roots for a given mod root (mod + workshop deps).
+    async fn search_roots(&self, mod_root: &Path) -> Vec<PathBuf> {
+        let cfg = self.build_validate_config().await;
+        let mut roots = vec![mod_root.to_path_buf()];
+        // Parse load_mod deps from tiger conf
+        let workshop_dir = cfg.as_ref().and_then(|c| c.workshop_dir.as_deref().map(PathBuf::from));
+        let conf_names = [
+            "vic3-tiger.conf",
+            "ck3-tiger.conf",
+            "imperator-tiger.conf",
+            "hoi4-tiger.conf",
+            "eu5-tiger.conf",
+        ];
+        for name in &conf_names {
+            let conf = mod_root.join(name);
+            if conf.exists() {
+                if let Ok(text) = std::fs::read_to_string(&conf) {
+                    for dep in parse_load_mod_roots(&text, mod_root, workshop_dir.as_deref()) {
+                        roots.push(dep);
+                    }
+                }
+                break;
+            }
+        }
+        if let Some(cfg) = cfg {
+            roots.push(cfg.game_dir.join("game"));
+        }
+        roots
+    }
+}
+
+/// Extract mod roots from load_mod blocks (duplicate of completions.rs logic, but sync).
+fn parse_load_mod_roots(
+    conf_text: &str,
+    mod_root: &Path,
+    workshop_dir: Option<&Path>,
+) -> Vec<PathBuf> {
+    let mut results = Vec::new();
+    let mut depth: i32 = 0;
+    let mut in_load_mod = false;
+    let mut cur_path: Option<String> = None;
+    let mut cur_id: Option<String> = None;
+
+    for line in conf_text.lines() {
+        let t = line.trim();
+        if t.starts_with('#') { continue; }
+        if depth == 0 && t.starts_with("load_mod") && t.contains('{') {
+            in_load_mod = true;
+            cur_path = None;
+            cur_id = None;
+        }
+        for ch in t.chars() {
+            if ch == '{' { depth += 1; }
+            if ch == '}' { depth -= 1; }
+        }
+        if in_load_mod && depth > 0 {
+            if let Some(v) = extract_conf_value(t, "mod") { cur_path = Some(v); }
+            if let Some(v) = extract_conf_value(t, "workshop_id") { cur_id = Some(v); }
+        }
+        if in_load_mod && depth == 0 {
+            in_load_mod = false;
+            if let Some(ref p) = cur_path {
+                let resolved = if Path::new(p).is_absolute() {
+                    PathBuf::from(p)
+                } else {
+                    mod_root.join(p)
+                };
+                if resolved.is_dir() { results.push(resolved); }
+            } else if let Some(ref id) = cur_id {
+                if let Some(ws) = workshop_dir {
+                    let p = ws.join(id);
+                    if p.is_dir() { results.push(p); }
+                }
+            }
+        }
+    }
+    results
+}
+
+fn extract_conf_value(line: &str, key: &str) -> Option<String> {
+    let rest = line.trim_start().strip_prefix(key)?.trim_start();
+    let rest = rest.strip_prefix('=')?.trim();
+    let rest = rest.split('#').next().unwrap_or(rest).trim();
+    let val = if rest.starts_with('"') && rest.ends_with('"') && rest.len() >= 2 {
+        &rest[1..rest.len() - 1]
+    } else {
+        rest
+    };
+    if val.is_empty() { None } else { Some(val.to_owned()) }
 }
 
 #[tower_lsp::async_trait]
@@ -176,6 +308,17 @@ impl LanguageServer for Backend {
                         ..Default::default()
                     },
                 )),
+                hover_provider: Some(HoverProviderCapability::Simple(true)),
+                definition_provider: Some(OneOf::Left(true)),
+                references_provider: Some(OneOf::Left(true)),
+                document_symbol_provider: Some(OneOf::Left(true)),
+                workspace_symbol_provider: Some(OneOf::Left(true)),
+                rename_provider: Some(OneOf::Right(RenameOptions {
+                    prepare_provider: Some(true),
+                    work_done_progress_options: Default::default(),
+                })),
+                folding_range_provider: Some(FoldingRangeProviderCapability::Simple(true)),
+                document_formatting_provider: Some(OneOf::Left(true)),
                 code_action_provider: Some(CodeActionProviderCapability::Simple(true)),
                 completion_provider: Some(CompletionOptions {
                     trigger_characters: Some(vec![
@@ -226,40 +369,236 @@ impl LanguageServer for Backend {
         self.documents.write().await.remove(&params.text_document.uri);
     }
 
+    // ─── Hover ───────────────────────────────────────────────────────────────
+
+    async fn hover(&self, params: HoverParams) -> LspResult<Option<Hover>> {
+        let uri = &params.text_document_position_params.text_document.uri;
+        let pos = &params.text_document_position_params.position;
+        let docs = self.documents.read().await;
+        let text = match docs.get(uri) { Some(t) => t, None => return Ok(None) };
+        let line = match text.lines().nth(pos.line as usize) { Some(l) => l, None => return Ok(None) };
+        let (word, _, _) = match word_at(line, pos.character as usize) { Some(w) => w, None => return Ok(None) };
+        drop(docs);
+
+        // @variable hover — check current document first.
+        if word.starts_with('@') {
+            let docs = self.documents.read().await;
+            if let Some(text) = docs.get(uri) {
+                return Ok(hover_variable(&word, text));
+            }
+        }
+
+        let path = match uri.to_file_path() { Ok(p) => p, Err(()) => return Ok(None) };
+        if let Some(mod_root) = Self::find_mod_root(&path) {
+            let defs = self.mod_definitions.read().await;
+            if let Some(definitions) = defs.get(&mod_root) {
+                if let Some((loc, detail)) = definitions.get(&word) {
+                    return Ok(hover_scripted(&word, detail, loc));
+                }
+            }
+        }
+
+        Ok(hover_builtin(&word))
+    }
+
+    // ─── Go to Definition ────────────────────────────────────────────────────
+
+    async fn goto_definition(
+        &self,
+        params: GotoDefinitionParams,
+    ) -> LspResult<Option<GotoDefinitionResponse>> {
+        let uri = &params.text_document_position_params.text_document.uri;
+        let pos = &params.text_document_position_params.position;
+        let docs = self.documents.read().await;
+        let text = match docs.get(uri) { Some(t) => t, None => return Ok(None) };
+        let line = match text.lines().nth(pos.line as usize) { Some(l) => l, None => return Ok(None) };
+        let (word, _, _) = match word_at(line, pos.character as usize) { Some(w) => w, None => return Ok(None) };
+        drop(docs);
+
+        let path = match uri.to_file_path() { Ok(p) => p, Err(()) => return Ok(None) };
+        if let Some(mod_root) = Self::find_mod_root(&path) {
+            let defs = self.mod_definitions.read().await;
+            if let Some(definitions) = defs.get(&mod_root) {
+                if let Some((loc, _detail)) = definitions.get(&word) {
+                    return Ok(Some(GotoDefinitionResponse::Scalar(loc.clone())));
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    // ─── Find References ─────────────────────────────────────────────────────
+
+    async fn references(&self, params: ReferenceParams) -> LspResult<Option<Vec<Location>>> {
+        let uri = &params.text_document_position.text_document.uri;
+        let pos = &params.text_document_position.position;
+        let docs = self.documents.read().await;
+        let text = match docs.get(uri) { Some(t) => t, None => return Ok(None) };
+        let line = match text.lines().nth(pos.line as usize) { Some(l) => l, None => return Ok(None) };
+        let (word, _, _) = match word_at(line, pos.character as usize) { Some(w) => w, None => return Ok(None) };
+        drop(docs);
+
+        let path = match uri.to_file_path() { Ok(p) => p, Err(()) => return Ok(None) };
+        let mod_root = match Self::find_mod_root(&path) { Some(r) => r, None => return Ok(None) };
+        let roots = self.search_roots(&mod_root).await;
+        let root_refs: Vec<&Path> = roots.iter().map(PathBuf::as_path).collect();
+
+        let refs = tokio::task::spawn_blocking({
+            let word = word.clone();
+            let roots: Vec<PathBuf> = roots.clone();
+            move || find_references(&word, &roots.iter().map(|p| p.as_path()).collect::<Vec<_>>())
+        })
+        .await
+        .unwrap_or_default();
+
+        drop(root_refs);
+        Ok(if refs.is_empty() { None } else { Some(refs) })
+    }
+
+    // ─── Rename ──────────────────────────────────────────────────────────────
+
+    async fn prepare_rename(
+        &self,
+        params: TextDocumentPositionParams,
+    ) -> LspResult<Option<PrepareRenameResponse>> {
+        let uri = &params.text_document.uri;
+        let pos = &params.position;
+        let docs = self.documents.read().await;
+        let text = match docs.get(uri) { Some(t) => t, None => return Ok(None) };
+        let line = match text.lines().nth(pos.line as usize) { Some(l) => l, None => return Ok(None) };
+        let (_, start, end) = match word_at(line, pos.character as usize) { Some(w) => w, None => return Ok(None) };
+
+        let range = Range {
+            start: Position { line: pos.line, character: start as u32 },
+            end: Position { line: pos.line, character: end as u32 },
+        };
+        Ok(Some(PrepareRenameResponse::Range(range)))
+    }
+
+    async fn rename(&self, params: RenameParams) -> LspResult<Option<WorkspaceEdit>> {
+        let uri = &params.text_document_position.text_document.uri;
+        let pos = &params.text_document_position.position;
+        let new_name = &params.new_name;
+        let docs = self.documents.read().await;
+        let text = match docs.get(uri) { Some(t) => t, None => return Ok(None) };
+        let line = match text.lines().nth(pos.line as usize) { Some(l) => l, None => return Ok(None) };
+        let (word, _, _) = match word_at(line, pos.character as usize) { Some(w) => w, None => return Ok(None) };
+        drop(docs);
+
+        let path = match uri.to_file_path() { Ok(p) => p, Err(()) => return Ok(None) };
+        let mod_root = match Self::find_mod_root(&path) { Some(r) => r, None => return Ok(None) };
+        let roots = self.search_roots(&mod_root).await;
+
+        let refs = tokio::task::spawn_blocking({
+            let word = word.clone();
+            let roots = roots.clone();
+            move || find_references(&word, &roots.iter().map(|p| p.as_path()).collect::<Vec<_>>())
+        })
+        .await
+        .unwrap_or_default();
+
+        if refs.is_empty() { return Ok(None); }
+        Ok(Some(rename_edit(&refs, new_name)))
+    }
+
+    // ─── Document Symbols ────────────────────────────────────────────────────
+
+    async fn document_symbol(
+        &self,
+        params: DocumentSymbolParams,
+    ) -> LspResult<Option<DocumentSymbolResponse>> {
+        let uri = &params.text_document.uri;
+        let docs = self.documents.read().await;
+        let text = match docs.get(uri) { Some(t) => t.clone(), None => return Ok(None) };
+        drop(docs);
+        let syms = document_symbols(&text);
+        if syms.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(DocumentSymbolResponse::Nested(syms)))
+        }
+    }
+
+    // ─── Workspace Symbols ───────────────────────────────────────────────────
+
+    async fn symbol(
+        &self,
+        params: WorkspaceSymbolParams,
+    ) -> LspResult<Option<Vec<SymbolInformation>>> {
+        let query = &params.query;
+        // Merge definitions from all known mod roots.
+        let all_defs = self.mod_definitions.read().await;
+        let mut merged: HashMap<String, (Location, String)> = HashMap::new();
+        for defs in all_defs.values() {
+            for (name, entry) in defs {
+                merged.entry(name.clone()).or_insert_with(|| entry.clone());
+            }
+        }
+        drop(all_defs);
+        let syms = workspace_symbols(query, &merged);
+        if syms.is_empty() { Ok(None) } else { Ok(Some(syms)) }
+    }
+
+    // ─── Folding Ranges ──────────────────────────────────────────────────────
+
+    async fn folding_range(
+        &self,
+        params: FoldingRangeParams,
+    ) -> LspResult<Option<Vec<FoldingRange>>> {
+        let uri = &params.text_document.uri;
+        let docs = self.documents.read().await;
+        let text = match docs.get(uri) { Some(t) => t.clone(), None => return Ok(None) };
+        drop(docs);
+        let ranges = folding_ranges(&text);
+        if ranges.is_empty() { Ok(None) } else { Ok(Some(ranges)) }
+    }
+
+    // ─── Formatting ──────────────────────────────────────────────────────────
+
+    async fn formatting(
+        &self,
+        params: DocumentFormattingParams,
+    ) -> LspResult<Option<Vec<TextEdit>>> {
+        let uri = &params.text_document.uri;
+        let docs = self.documents.read().await;
+        let text = match docs.get(uri) { Some(t) => t.clone(), None => return Ok(None) };
+        drop(docs);
+        Ok(format_document(&text))
+    }
+
+    // ─── Completion ──────────────────────────────────────────────────────────
+
     async fn completion(&self, params: CompletionParams) -> LspResult<Option<CompletionResponse>> {
         let uri = &params.text_document_position.text_document.uri;
+        let path = match uri.to_file_path() { Ok(p) => p, Err(()) => return Ok(None) };
 
-        let path = match uri.to_file_path() {
-            Ok(p) => p,
-            Err(()) => return Ok(None),
-        };
-
-        // Tier 1a: static keywords (AND/OR/if/limit/…)
         let mut items = static_keywords();
-        // Tier 1b: engine built-ins from tiger-lib tables (triggers, effects, iterators)
         items.extend_from_slice(builtin_completions());
 
-        // Tier 2: @variables from current document
         let docs = self.documents.read().await;
         if let Some(text) = docs.get(uri) {
             items.extend(variable_completions(text));
         }
         drop(docs);
 
-        // Tier 3: mod filesystem items
         if let Some(mod_root) = Self::find_mod_root(&path) {
             if let Some(cached) = self.mod_completions.read().await.get(&mod_root) {
                 items.extend(cached.clone());
             } else {
-                // First open before any validation — do a quick blocking scan.
                 let root_clone = mod_root.clone();
-                let game_dir = self.build_validate_config().await.map(|c| c.game_dir);
-                if let Ok(scanned) = tokio::task::spawn_blocking(move || {
-                    scan_mod_items(&root_clone, game_dir.as_deref()).into_completion_items()
+                let cfg = self.build_validate_config().await;
+                let game_dir = cfg.as_ref().map(|c| c.game_dir.clone());
+                let workshop_dir = cfg.as_ref().and_then(|c| c.workshop_dir.clone());
+                if let Ok(scan) = tokio::task::spawn_blocking(move || {
+                    scan_mod_items(&root_clone, game_dir.as_deref(), workshop_dir.as_deref())
                 })
                 .await
                 {
-                    self.mod_completions.write().await.insert(mod_root, scanned.clone());
+                    let raw_defs = scan.definitions.clone();
+                    let scanned = scan.into_completion_items();
+                    let definitions = defs_to_locations(raw_defs);
+                    self.mod_completions.write().await.insert(mod_root.clone(), scanned.clone());
+                    self.mod_definitions.write().await.insert(mod_root, definitions);
                     items.extend(scanned);
                 }
             }
@@ -268,20 +607,19 @@ impl LanguageServer for Backend {
         Ok(Some(CompletionResponse::Array(items)))
     }
 
+    // ─── Code Actions ────────────────────────────────────────────────────────
+
     async fn code_action(&self, params: CodeActionParams) -> LspResult<Option<CodeActionResponse>> {
         let uri = &params.text_document.uri;
         let docs = self.documents.read().await;
-        let text = match docs.get(uri) {
-            Some(t) => t,
-            None => return Ok(None),
-        };
+        let text = match docs.get(uri) { Some(t) => t, None => return Ok(None) };
         let lines: Vec<&str> = text.lines().collect();
         let violations = find_violations(&lines);
-        let request_start = params.range.start.line;
-        let request_end = params.range.end.line;
+        let start = params.range.start.line;
+        let end = params.range.end.line;
         let actions: Vec<CodeActionOrCommand> = violations
             .iter()
-            .filter(|v| v.not_line <= request_end && v.not_close_line >= request_start)
+            .filter(|v| v.not_line <= end && v.not_close_line >= start)
             .map(|v| violation_to_action(uri, &lines, v))
             .collect();
         if actions.is_empty() { Ok(None) } else { Ok(Some(actions)) }
