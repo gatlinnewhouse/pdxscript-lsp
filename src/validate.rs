@@ -13,7 +13,7 @@ use anyhow::Result;
 use tiger_lib::ModMetadata;
 #[cfg(any(feature = "ck3", feature = "imperator", feature = "hoi4"))]
 use tiger_lib::ModFile;
-use tiger_lib::{Everything, Severity, take_reports};
+use tiger_lib::{Confidence, Everything, Severity, take_reports};
 use tower_lsp::lsp_types::{
     Diagnostic, DiagnosticSeverity, NumberOrString, Position, Range, Url,
 };
@@ -106,7 +106,16 @@ pub fn validate_mod(mod_root: &Path, cfg: &ValidateConfig) -> Result<DiagMap> {
 
             let range = loc_to_range(primary.loc.line, primary.loc.column, primary.length);
 
-            let mut message = format!("[{}] {}", meta.key, meta.msg);
+            // Prefix with confidence tag for weak reports so modders know it may be a false positive.
+            let conf_prefix = if meta.confidence == Confidence::Weak {
+                "[weak] "
+            } else {
+                ""
+            };
+            let mut message = format!("{conf_prefix}[{}] {}", meta.key, meta.msg);
+            if meta.confidence == Confidence::Weak {
+                message.push_str("\n(low confidence — likely a false positive)");
+            }
             if let Some(info) = &meta.info {
                 message.push('\n');
                 message.push_str(info);
@@ -114,6 +123,9 @@ pub fn validate_mod(mod_root: &Path, cfg: &ValidateConfig) -> Result<DiagMap> {
             if let Some(wiki) = &meta.wiki {
                 message.push('\n');
                 message.push_str(wiki);
+            } else if let Some(url) = crate::wiki::fallback_wiki_url(&meta.key.to_string()) {
+                message.push('\n');
+                message.push_str(url);
             }
 
             // Attach related locations for secondary pointers.
@@ -135,6 +147,11 @@ pub fn validate_mod(mod_root: &Path, cfg: &ValidateConfig) -> Result<DiagMap> {
                 None
             };
 
+            let confidence_str = match meta.confidence {
+                Confidence::Weak       => "weak",
+                Confidence::Reasonable => "reasonable",
+                Confidence::Strong     => "strong",
+            };
             let diag = Diagnostic {
                 range,
                 severity: Some(severity_to_lsp(meta.severity)),
@@ -142,6 +159,8 @@ pub fn validate_mod(mod_root: &Path, cfg: &ValidateConfig) -> Result<DiagMap> {
                 source: Some("pdxscript-lsp".to_owned()),
                 message,
                 related_information: related,
+                // Stash confidence in data so hover can display the real value.
+                data: Some(serde_json::json!({ "confidence": confidence_str })),
                 ..Default::default()
             };
 

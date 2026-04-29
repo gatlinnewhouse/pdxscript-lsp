@@ -8,6 +8,7 @@ use tiger_lib::LspEntryKind;
 // ─── Per-game wiki roots ──────────────────────────────────────────────────────
 
 #[cfg(feature = "vic3")]
+#[allow(dead_code)]
 mod urls {
     pub const BASE:                &str = "https://vic3.paradoxwikis.com";
     pub const TRIGGERS:            &str = "https://vic3.paradoxwikis.com/Trigger";
@@ -99,6 +100,57 @@ pub fn scripted_wiki_url(detail: &str) -> &'static str {
     }
 }
 
-pub fn variables_url()    -> &'static str { urls::VARIABLES }
-pub fn modding_index_url() -> &'static str { urls::MODDING_INDEX }
-pub fn wiki_base()         -> &'static str { urls::BASE }
+pub fn variables_url()         -> &'static str { urls::VARIABLES }
+#[allow(dead_code)]
+pub fn modding_index_url()     -> &'static str { urls::MODDING_INDEX }
+#[allow(dead_code)]
+pub fn wiki_base()             -> &'static str { urls::BASE }
+
+/// Fallback wiki URL for a tiger `ErrorKey` (kebab-case string) when tiger-lib
+/// doesn't provide one.  Returns `None` for keys where no relevant page exists.
+pub fn fallback_wiki_url(key: &str) -> Option<&'static str> {
+    match key {
+        "scopes" | "strict-scopes" | "temporary-scope" | "use-of-this"
+            => Some(urls::SCOPES),
+        "variables" | "unknown-variable"
+            => Some(urls::VARIABLES),
+        "localization" | "missing-localization" | "suggest-localization"
+        | "unused-localization" | "localization-key-collision" | "markup"
+            => None,  // no single clean page; skip
+        "modifiers"
+            => Some(urls::SCRIPTED_MODIFIERS),
+        _ => Some(urls::MODDING_INDEX),
+    }
+}
+
+// ─── Tiger validator reference ────────────────────────────────────────────────
+
+#[allow(dead_code)]
+pub const TIGER_OVERVIEW: &str =
+    "https://github.com/amtep/tiger/wiki/Overview-for-coders";
+
+pub const TIGER_JSON_FORMAT: &str =
+    "https://github.com/amtep/tiger/wiki/JSON-output-format";
+
+/// Human-readable explanation of a tiger severity level.
+/// Matches the levels documented in tiger's JSON output format wiki page.
+pub fn severity_doc(severity: &str) -> &'static str {
+    match severity {
+        "tips"    => "things that aren't wrong but could be improved",
+        "untidy"  => "won't affect the player but will cause maintenance headaches",
+        "warning" => "the player will notice but gameplay is unaffected (e.g. missing localization)",
+        "error"   => "bugs likely to affect gameplay",
+        "fatal"   => "can cause crashes",
+        _         => "unknown severity",
+    }
+}
+
+/// Human-readable explanation of a tiger confidence level.
+pub fn confidence_doc(confidence: &str) -> &'static str {
+    match confidence {
+        "weak"       => "likely a false positive",
+        "reasonable" => "probably a real problem",
+        "strong"     => "very likely a real problem",
+        _            => "unknown confidence",
+    }
+}

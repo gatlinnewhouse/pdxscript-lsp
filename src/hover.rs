@@ -93,6 +93,32 @@ pub fn hover_variable(name: &str, doc_text: &str) -> Option<Hover> {
     None
 }
 
+/// Hover for a tiger diagnostic code — shown when the user hovers a `[key]` error code.
+/// Explains severity and confidence so modders understand what to act on.
+pub fn hover_diagnostic_code(
+    key: &str,
+    severity: &str,
+    confidence: &str,
+    wiki_link: Option<&str>,
+) -> Hover {
+    use crate::wiki::{TIGER_JSON_FORMAT, confidence_doc, severity_doc};
+    let sev_desc = severity_doc(severity);
+    let conf_desc = confidence_doc(confidence);
+    let wiki_line = wiki_link
+        .map(|u| format!("\n\n[Wiki]({u})"))
+        .unwrap_or_default();
+    let value = format!(
+        "**`[{key}]`** — tiger validation error\n\n\
+         **Severity** `{severity}`: {sev_desc}\n\n\
+         **Confidence** `{confidence}`: {conf_desc}\n\n\
+         [Tiger error format reference]({TIGER_JSON_FORMAT}){wiki_line}"
+    );
+    Hover {
+        contents: HoverContents::Markup(MarkupContent { kind: MarkupKind::Markdown, value }),
+        range: None,
+    }
+}
+
 fn builtin_index() -> &'static HashMap<String, LspEntryKind> {
     use std::sync::OnceLock;
     static CACHE: OnceLock<HashMap<String, LspEntryKind>> = OnceLock::new();

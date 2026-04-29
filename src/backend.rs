@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 use tokio::sync::{Mutex, RwLock};
 use tower_lsp::jsonrpc::Result as LspResult;
+use tower_lsp::lsp_types::request::{GotoDeclarationParams, GotoDeclarationResponse};
 use tower_lsp::lsp_types::*;
 use tower_lsp::{Client, LanguageServer};
 
@@ -18,10 +19,10 @@ use crate::format::format_document;
 use crate::gamedir::{
     TIGER_CONF, find_game_directory_steam, find_paradox_directory, find_workshop_directory_steam,
 };
-use crate::hover::{hover_builtin, hover_scripted, hover_variable};
+use crate::hover::{hover_builtin, hover_diagnostic_code, hover_scripted, hover_variable};
 use crate::references::{find_references, rename_edit};
 use crate::symbols::{
-    defs_to_locations, document_symbols, top_level_key, word_at, workspace_symbols,
+    defs_to_locations, document_symbols, word_at, workspace_symbols,
 };
 use crate::validate::{DiagMap, ValidateConfig, validate_mod};
 
@@ -191,14 +192,6 @@ impl Backend {
         self.client.publish_diagnostics(uri.clone(), diags, None).await;
     }
 
-    /// Resolve the word under the cursor to a (Location, detail) pair.
-    fn resolve_word<'a>(
-        word: &str,
-        definitions: &'a HashMap<String, (Location, String)>,
-    ) -> Option<&'a (Location, String)> {
-        definitions.get(word)
-    }
-
     /// Collect all mod search roots for a given mod root (mod + workshop deps).
     async fn search_roots(&self, mod_root: &Path) -> Vec<PathBuf> {
         let cfg = self.build_validate_config().await;
@@ -310,6 +303,7 @@ impl LanguageServer for Backend {
                 )),
                 hover_provider: Some(HoverProviderCapability::Simple(true)),
                 definition_provider: Some(OneOf::Left(true)),
+                declaration_provider: Some(DeclarationCapability::Simple(true)),
                 references_provider: Some(OneOf::Left(true)),
                 document_symbol_provider: Some(OneOf::Left(true)),
                 workspace_symbol_provider: Some(OneOf::Left(true)),
@@ -323,10 +317,16 @@ impl LanguageServer for Backend {
                 completion_provider: Some(CompletionOptions {
                     trigger_characters: Some(vec![
                         "@".to_owned(),
+                        "$".to_owned(),
                         " ".to_owned(),
                         "=".to_owned(),
                     ]),
                     ..Default::default()
+                }),
+                signature_help_provider: Some(SignatureHelpOptions {
+                    trigger_characters: Some(vec!["{".to_owned(), " ".to_owned()]),
+                    retrigger_characters: Some(vec!["\n".to_owned()]),
+                    work_done_progress_options: Default::default(),
                 }),
                 ..Default::default()
             },
@@ -388,6 +388,40 @@ impl LanguageServer for Backend {
             }
         }
 
+        // Diagnostic code hover — if the cursor is inside a published diagnostic range,
+        // show severity/confidence explanation for the tiger error key.
+        {
+            let published = self.published.lock().await;
+            if let Some(diags) = published.get(uri) {
+                for diag in diags {
+                    let r = diag.range;
+                    if r.start.line == pos.line
+                        && pos.character >= r.start.character
+                        && pos.character <= r.end.character
+                    {
+                        if let Some(NumberOrString::String(ref key)) = diag.code {
+                            let sev = match diag.severity {
+                                Some(DiagnosticSeverity::ERROR)       => "error",
+                                Some(DiagnosticSeverity::WARNING)     => "warning",
+                                Some(DiagnosticSeverity::INFORMATION) => "untidy",
+                                Some(DiagnosticSeverity::HINT)        => "tips",
+                                _ => "unknown",
+                            };
+                            // Extract wiki link from message (last line starting with http)
+                            let wiki = diag.message.lines()
+                                .find(|l| l.starts_with("http"))
+                                .map(|l| l.trim());
+                            let conf = diag.data.as_ref()
+                                .and_then(|d| d.get("confidence"))
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("reasonable");
+                            return Ok(Some(hover_diagnostic_code(key, sev, conf, wiki)));
+                        }
+                    }
+                }
+            }
+        }
+
         let path = match uri.to_file_path() { Ok(p) => p, Err(()) => return Ok(None) };
         if let Some(mod_root) = Self::find_mod_root(&path) {
             let defs = self.mod_definitions.read().await;
@@ -425,6 +459,29 @@ impl LanguageServer for Backend {
             }
         }
         Ok(None)
+    }
+
+    // ─── Declaration (alias to definition) ──────────────────────────────────
+
+    async fn goto_declaration(
+        &self,
+        params: GotoDeclarationParams,
+    ) -> LspResult<Option<GotoDeclarationResponse>> {
+        // PDX script has no separate declaration/definition distinction.
+        let def_params = GotoDefinitionParams {
+            text_document_position_params: params.text_document_position_params,
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        };
+        match self.goto_definition(def_params).await? {
+            Some(GotoDefinitionResponse::Scalar(loc)) =>
+                Ok(Some(GotoDeclarationResponse::Scalar(loc))),
+            Some(GotoDefinitionResponse::Array(locs)) =>
+                Ok(Some(GotoDeclarationResponse::Array(locs))),
+            Some(GotoDefinitionResponse::Link(links)) =>
+                Ok(Some(GotoDeclarationResponse::Link(links))),
+            None => Ok(None),
+        }
     }
 
     // ─── Find References ─────────────────────────────────────────────────────
@@ -501,6 +558,58 @@ impl LanguageServer for Backend {
         Ok(Some(rename_edit(&refs, new_name)))
     }
 
+    // ─── Signature Help ──────────────────────────────────────────────────────
+
+    async fn signature_help(&self, params: SignatureHelpParams) -> LspResult<Option<SignatureHelp>> {
+        let uri = &params.text_document_position_params.text_document.uri;
+        let pos = &params.text_document_position_params.position;
+        let docs = self.documents.read().await;
+        let text = match docs.get(uri) { Some(t) => t.clone(), None => return Ok(None) };
+        drop(docs);
+
+        // Walk backward from cursor to find the enclosing `name = {` block opener.
+        let lines: Vec<&str> = text.lines().collect();
+        let cursor_line = pos.line as usize;
+        let cursor_col  = pos.character as usize;
+
+        let trigger_name = find_enclosing_block_trigger(&lines, cursor_line, cursor_col);
+        let name = match trigger_name { Some(n) => n, None => return Ok(None) };
+
+        let schema = tiger_lib::block_schema(&name);
+        let fields = match schema { Some(f) => f, None => return Ok(None) };
+
+        // Build parameter list: "required_field: type" or "?optional_field: type"
+        let params_info: Vec<ParameterInformation> = fields.iter().map(|f| {
+            let label = if f.required {
+                format!("{}: {}", f.name, f.type_hint)
+            } else {
+                format!("?{}: {}", f.name, f.type_hint)
+            };
+            ParameterInformation {
+                label: ParameterLabel::Simple(label),
+                documentation: None,
+            }
+        }).collect();
+
+        let param_list = fields.iter().map(|f| {
+            if f.required { format!("{}: {}", f.name, f.type_hint) }
+            else { format!("?{}: {}", f.name, f.type_hint) }
+        }).collect::<Vec<_>>().join("  |  ");
+
+        let sig = SignatureInformation {
+            label: format!("{name} = {{ {param_list} }}"),
+            documentation: None,
+            parameters: Some(params_info),
+            active_parameter: None,
+        };
+
+        Ok(Some(SignatureHelp {
+            signatures: vec![sig],
+            active_signature: Some(0),
+            active_parameter: None,
+        }))
+    }
+
     // ─── Document Symbols ────────────────────────────────────────────────────
 
     async fn document_symbol(
@@ -572,6 +681,27 @@ impl LanguageServer for Backend {
         let uri = &params.text_document_position.text_document.uri;
         let path = match uri.to_file_path() { Ok(p) => p, Err(()) => return Ok(None) };
 
+        // When triggered by `$`, only return localization key completions.
+        let trigger = params.context.as_ref()
+            .and_then(|c| c.trigger_character.as_deref());
+        if trigger == Some("$") {
+            let mut loca_items = Vec::new();
+            if let Some(mod_root) = Self::find_mod_root(&path) {
+                let cfg = self.build_validate_config().await;
+                let game_dir = cfg.as_ref().map(|c| c.game_dir.clone());
+                let keys = tokio::task::spawn_blocking(move || {
+                    crate::completions::loca_completions(&mod_root, game_dir.as_deref())
+                })
+                .await
+                .unwrap_or_default();
+                loca_items.extend(keys);
+            }
+            return Ok(Some(CompletionResponse::List(CompletionList {
+                is_incomplete: false,
+                items: loca_items,
+            })));
+        }
+
         let mut items = static_keywords();
         items.extend_from_slice(builtin_completions());
 
@@ -604,7 +734,10 @@ impl LanguageServer for Backend {
             }
         }
 
-        Ok(Some(CompletionResponse::Array(items)))
+        Ok(Some(CompletionResponse::List(CompletionList {
+            is_incomplete: false,
+            items,
+        })))
     }
 
     // ─── Code Actions ────────────────────────────────────────────────────────
@@ -630,4 +763,44 @@ impl LanguageServer for Backend {
             *self.settings.write().await = s;
         }
     }
+}
+
+/// Walk backward from `(line, col)` to find the identifier before the nearest
+/// unclosed `= {`.  Returns `None` if the cursor isn't inside a block.
+///
+/// Scans upward one line at a time, tracking brace depth.  When depth reaches
+/// -1 (we've passed an unmatched `{`), we look at the text immediately before
+/// the `{` for a `name = {` or `name = {` pattern and extract the name.
+fn find_enclosing_block_trigger(lines: &[&str], cursor_line: usize, cursor_col: usize) -> Option<String> {
+    let mut depth: i32 = 0;
+
+    for li in (0..=cursor_line).rev() {
+        let line = lines.get(li)?;
+        // For the cursor line, only look at chars before the cursor.
+        let slice = if li == cursor_line { &line[..cursor_col.min(line.len())] } else { line };
+
+        // Scan right-to-left to find the first unmatched `{`.
+        for (ci, ch) in slice.char_indices().rev() {
+            match ch {
+                '}' => depth += 1,
+                '{' => {
+                    if depth == 0 {
+                        // Found the enclosing brace.  Look for `word = {` before it.
+                        let before = slice[..ci].trim_end();
+                        // Strip trailing `=` and whitespace.
+                        let before = before.trim_end_matches(|c: char| c == '=' || c.is_whitespace());
+                        // Extract the last identifier-like word.
+                        let word: String = before.chars().rev()
+                            .take_while(|c| c.is_alphanumeric() || *c == '_')
+                            .collect::<String>()
+                            .chars().rev().collect();
+                        return if word.is_empty() { None } else { Some(word) };
+                    }
+                    depth -= 1;
+                }
+                _ => {}
+            }
+        }
+    }
+    None
 }
