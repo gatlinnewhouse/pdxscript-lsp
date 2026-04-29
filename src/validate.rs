@@ -13,9 +13,13 @@ use anyhow::Result;
 use tiger_lib::ModMetadata;
 #[cfg(any(feature = "ck3", feature = "imperator", feature = "hoi4"))]
 use tiger_lib::ModFile;
-use tiger_lib::{Confidence, Everything, Severity, take_reports};
+use tiger_lib::{
+    Confidence, Everything, LspAnnotationKind, Severity,
+    set_lsp_mode, take_annotations, take_reports,
+};
 use tower_lsp::lsp_types::{
-    Diagnostic, DiagnosticSeverity, NumberOrString, Position, Range, Url,
+    Diagnostic, DiagnosticSeverity, InlayHint, InlayHintKind, InlayHintLabel,
+    NumberOrString, Position, Range, Url,
 };
 
 /// Serializes all validation runs — tiger-lib ERRORS is a global static.
@@ -23,6 +27,9 @@ static VALIDATION_LOCK: Mutex<()> = Mutex::new(());
 
 /// Per-file diagnostics keyed by absolute path URI.
 pub type DiagMap = HashMap<Url, Vec<Diagnostic>>;
+
+/// Per-file inlay hints collected from tiger-lib scope annotations.
+pub type HintMap = HashMap<Url, Vec<InlayHint>>;
 
 /// Configuration paths needed to run validation.
 #[derive(Debug, Clone)]
@@ -33,11 +40,11 @@ pub struct ValidateConfig {
     pub config_file: Option<PathBuf>,
 }
 
-/// Validate the mod at `mod_root` and return per-file diagnostics.
+/// Validate the mod at `mod_root` and return per-file diagnostics + scope inlay hints.
 ///
 /// Blocks the calling thread — intended to be run inside
 /// `tokio::task::spawn_blocking`.
-pub fn validate_mod(mod_root: &Path, cfg: &ValidateConfig) -> Result<DiagMap> {
+pub fn validate_mod(mod_root: &Path, cfg: &ValidateConfig) -> Result<(DiagMap, HintMap)> {
     let _lock = VALIDATION_LOCK
         .lock()
         .unwrap_or_else(|e| e.into_inner());
@@ -84,10 +91,14 @@ pub fn validate_mod(mod_root: &Path, cfg: &ValidateConfig) -> Result<DiagMap> {
     everything.load_output_settings(false);
     everything.load_config_filtering_rules();
     everything.load_all();
+    // Enable scope annotations so inlay hints are populated.
+    set_lsp_mode(true);
     everything.validate_all();
+    set_lsp_mode(false);
 
-    // Drain the global report store before releasing the lock.
+    // Drain both stores before releasing the lock.
     let raw = take_reports();
+    let annotations = take_annotations();
 
     let mut map: DiagMap = HashMap::new();
 
@@ -168,7 +179,35 @@ pub fn validate_mod(mod_root: &Path, cfg: &ValidateConfig) -> Result<DiagMap> {
         }
     }
 
-    Ok(map)
+    // Convert scope annotations to LSP inlay hints.
+    let mut hint_map: HintMap = HashMap::new();
+    for ann in annotations {
+        let fullpath = ann.loc.fullpath();
+        let uri = match path_to_uri(fullpath) {
+            Ok(u) => u,
+            Err(_) => continue,
+        };
+        if ann.loc.line == 0 { continue; }
+        let LspAnnotationKind::Scope(scope_str) = ann.kind;
+        // Show scope at start of the block line (column 0 of that line).
+        let pos = Position {
+            line: ann.loc.line.saturating_sub(1),
+            character: 0,
+        };
+        let hint = InlayHint {
+            position: pos,
+            label: InlayHintLabel::String(format!("⟨{scope_str}⟩")),
+            kind: Some(InlayHintKind::TYPE),
+            text_edits: None,
+            tooltip: None,
+            padding_left: Some(false),
+            padding_right: Some(true),
+            data: None,
+        };
+        hint_map.entry(uri).or_default().push(hint);
+    }
+
+    Ok((map, hint_map))
 }
 
 fn path_to_uri(path: &Path) -> Result<Url> {

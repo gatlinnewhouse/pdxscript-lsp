@@ -24,7 +24,7 @@ use crate::references::{find_references, rename_edit};
 use crate::symbols::{
     defs_to_locations, document_symbols, word_at, workspace_symbols,
 };
-use crate::validate::{DiagMap, ValidateConfig, validate_mod};
+use crate::validate::{DiagMap, HintMap, ValidateConfig, validate_mod};
 
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
@@ -45,6 +45,8 @@ pub struct Backend {
     /// Definition locations + detail for scripted items per mod root.
     /// Value: (Location, detail_str) where detail is "scripted_effect", "event", etc.
     mod_definitions: RwLock<HashMap<PathBuf, HashMap<String, (Location, String)>>>,
+    /// Scope inlay hints per file URI, collected from tiger-lib scope annotations.
+    inlay_hints: RwLock<HintMap>,
 }
 
 impl Backend {
@@ -57,6 +59,7 @@ impl Backend {
             documents: RwLock::new(HashMap::new()),
             mod_completions: RwLock::new(HashMap::new()),
             mod_definitions: RwLock::new(HashMap::new()),
+            inlay_hints: RwLock::new(HashMap::new()),
         }
     }
 
@@ -122,7 +125,9 @@ impl Backend {
             tokio::task::spawn_blocking(move || validate_mod(&mod_root_clone, &cfg)).await;
 
         match result {
-            Ok(Ok(diag_map)) => {
+            Ok(Ok((diag_map, hint_map))) => {
+                // Merge new hints into global store (replace entries for affected files).
+                self.inlay_hints.write().await.extend(hint_map);
                 self.publish_tiger_diagnostics(diag_map).await;
                 self.refresh_mod_index(mod_root).await;
             }
@@ -328,6 +333,36 @@ impl LanguageServer for Backend {
                     retrigger_characters: Some(vec!["\n".to_owned()]),
                     work_done_progress_options: Default::default(),
                 }),
+                document_highlight_provider: Some(OneOf::Left(true)),
+                document_link_provider: Some(DocumentLinkOptions {
+                    resolve_provider: Some(false),
+                    work_done_progress_options: Default::default(),
+                }),
+                inlay_hint_provider: Some(OneOf::Left(true)),
+                code_lens_provider: Some(CodeLensOptions {
+                    resolve_provider: Some(false),
+                }),
+                selection_range_provider: Some(SelectionRangeProviderCapability::Simple(true)),
+                semantic_tokens_provider: Some(
+                    SemanticTokensServerCapabilities::SemanticTokensOptions(SemanticTokensOptions {
+                        legend: SemanticTokensLegend {
+                            token_types: vec![
+                                SemanticTokenType::KEYWORD,
+                                SemanticTokenType::FUNCTION,
+                                SemanticTokenType::VARIABLE,
+                                SemanticTokenType::STRING,
+                                SemanticTokenType::COMMENT,
+                                SemanticTokenType::NUMBER,
+                            ],
+                            token_modifiers: vec![
+                                SemanticTokenModifier::DEFINITION,
+                            ],
+                        },
+                        full: Some(SemanticTokensFullOptions::Bool(true)),
+                        range: Some(false),
+                        work_done_progress_options: Default::default(),
+                    }),
+                ),
                 ..Default::default()
             },
             server_info: Some(ServerInfo {
@@ -763,6 +798,191 @@ impl LanguageServer for Backend {
             *self.settings.write().await = s;
         }
     }
+
+    // ─── Document Highlight ──────────────────────────────────────────────────
+
+    async fn document_highlight(
+        &self,
+        params: DocumentHighlightParams,
+    ) -> LspResult<Option<Vec<DocumentHighlight>>> {
+        let uri = &params.text_document_position_params.text_document.uri;
+        let pos = &params.text_document_position_params.position;
+        let docs = self.documents.read().await;
+        let text = match docs.get(uri) { Some(t) => t, None => return Ok(None) };
+        let line = match text.lines().nth(pos.line as usize) { Some(l) => l, None => return Ok(None) };
+        let (word, _, _) = match word_at(line, pos.character as usize) { Some(w) => w, None => return Ok(None) };
+        drop(docs);
+
+        // Find all occurrences in this document only.
+        let path = match uri.to_file_path() { Ok(p) => p, Err(()) => return Ok(None) };
+        let locs = crate::references::find_references(&word, &[&path]);
+        if locs.is_empty() { return Ok(None); }
+        let highlights = locs.into_iter()
+            .map(|loc| DocumentHighlight { range: loc.range, kind: Some(DocumentHighlightKind::TEXT) })
+            .collect();
+        Ok(Some(highlights))
+    }
+
+    // ─── Document Link ───────────────────────────────────────────────────────
+
+    async fn document_link(
+        &self,
+        params: DocumentLinkParams,
+    ) -> LspResult<Option<Vec<DocumentLink>>> {
+        let uri = &params.text_document.uri;
+        let docs = self.documents.read().await;
+        let text = match docs.get(uri) { Some(t) => t.clone(), None => return Ok(None) };
+        drop(docs);
+
+        let mut links = Vec::new();
+        for (line_idx, line) in text.lines().enumerate() {
+            // Extract http(s):// URLs from line.
+            let mut search = line;
+            let mut col_offset = 0usize;
+            while let Some(start) = search.find("http://").or_else(|| search.find("https://")) {
+                let url_start = col_offset + start;
+                let rest = &search[start..];
+                let end = rest.find(|c: char| c.is_whitespace() || c == ')' || c == '"' || c == '\'')
+                    .unwrap_or(rest.len());
+                let url_str = &rest[..end];
+                if let Ok(target) = Url::parse(url_str) {
+                    let range = Range {
+                        start: Position { line: line_idx as u32, character: url_start as u32 },
+                        end: Position { line: line_idx as u32, character: (url_start + end) as u32 },
+                    };
+                    links.push(DocumentLink {
+                        range,
+                        target: Some(target),
+                        tooltip: None,
+                        data: None,
+                    });
+                }
+                col_offset += start + end;
+                search = &search[start + end..];
+            }
+        }
+        Ok(if links.is_empty() { None } else { Some(links) })
+    }
+
+    // ─── Inlay Hints ─────────────────────────────────────────────────────────
+
+    async fn inlay_hint(
+        &self,
+        params: InlayHintParams,
+    ) -> LspResult<Option<Vec<InlayHint>>> {
+        let uri = &params.text_document.uri;
+        let hints = self.inlay_hints.read().await;
+        if let Some(file_hints) = hints.get(uri) {
+            // Filter to the requested range.
+            let range = &params.range;
+            let filtered: Vec<InlayHint> = file_hints.iter()
+                .filter(|h| h.position.line >= range.start.line && h.position.line <= range.end.line)
+                .cloned()
+                .collect();
+            Ok(if filtered.is_empty() { None } else { Some(filtered) })
+        } else {
+            Ok(None)
+        }
+    }
+
+    // ─── Code Lens ───────────────────────────────────────────────────────────
+
+    async fn code_lens(&self, params: CodeLensParams) -> LspResult<Option<Vec<CodeLens>>> {
+        let uri = &params.text_document.uri;
+        let docs = self.documents.read().await;
+        let text = match docs.get(uri) { Some(t) => t.clone(), None => return Ok(None) };
+        drop(docs);
+
+        let path = match uri.to_file_path() { Ok(p) => p, Err(()) => return Ok(None) };
+        let mod_root = match Self::find_mod_root(&path) { Some(r) => r, None => return Ok(None) };
+        let defs = self.mod_definitions.read().await;
+        let definitions = match defs.get(&mod_root) { Some(d) => d, None => return Ok(None) };
+
+        let mut lenses = Vec::new();
+        // For each top-level definition in this document, count references.
+        for (line_idx, line) in text.lines().enumerate() {
+            // Look for top-level `name = {` patterns.
+            let t = line.trim_end();
+            if t.ends_with('{') && !line.starts_with(|c: char| c.is_whitespace()) {
+                let before_brace = t[..t.len()-1].trim_end();
+                if let Some(name) = before_brace.strip_suffix('=').map(|s| s.trim_end()) {
+                    if definitions.contains_key(name) {
+                        let roots = self.search_roots(&mod_root).await;
+                        let word = name.to_owned();
+                        let ref_count = tokio::task::spawn_blocking({
+                            let roots = roots.clone();
+                            let word = word.clone();
+                            move || crate::references::find_references(
+                                &word,
+                                &roots.iter().map(|p| p.as_path()).collect::<Vec<_>>(),
+                            )
+                        })
+                        .await
+                        .map(|r| r.len())
+                        .unwrap_or(0);
+
+                        let range = Range {
+                            start: Position { line: line_idx as u32, character: 0 },
+                            end: Position { line: line_idx as u32, character: t.len() as u32 },
+                        };
+                        lenses.push(CodeLens {
+                            range,
+                            command: Some(Command {
+                                title: format!(
+                                    "{ref_count} reference{}",
+                                    if ref_count == 1 { "" } else { "s" }
+                                ),
+                                command: "editor.action.findReferences".to_owned(),
+                                arguments: None,
+                            }),
+                            data: None,
+                        });
+                    }
+                }
+            }
+        }
+        Ok(if lenses.is_empty() { None } else { Some(lenses) })
+    }
+
+    // ─── Selection Range ─────────────────────────────────────────────────────
+
+    async fn selection_range(
+        &self,
+        params: SelectionRangeParams,
+    ) -> LspResult<Option<Vec<SelectionRange>>> {
+        let uri = &params.text_document.uri;
+        let docs = self.documents.read().await;
+        let text = match docs.get(uri) { Some(t) => t.clone(), None => return Ok(None) };
+        drop(docs);
+
+        let lines: Vec<&str> = text.lines().collect();
+        let results = params.positions.iter().map(|pos| {
+            selection_range_at(&lines, pos)
+        }).collect();
+        Ok(Some(results))
+    }
+
+    // ─── Semantic Tokens (full document) ────────────────────────────────────
+
+    async fn semantic_tokens_full(
+        &self,
+        params: SemanticTokensParams,
+    ) -> LspResult<Option<SemanticTokensResult>> {
+        let uri = &params.text_document.uri;
+        let docs = self.documents.read().await;
+        let text = match docs.get(uri) { Some(t) => t.clone(), None => return Ok(None) };
+        drop(docs);
+
+        let path = match uri.to_file_path() { Ok(p) => p, Err(()) => return Ok(None) };
+        let mod_root = Self::find_mod_root(&path);
+        let defs = self.mod_definitions.read().await;
+        let definitions: Option<&HashMap<String, (Location, String)>> =
+            mod_root.as_ref().and_then(|r| defs.get(r));
+
+        let data = build_semantic_tokens(&text, definitions);
+        if data.is_empty() { return Ok(None); }
+        Ok(Some(SemanticTokensResult::Tokens(SemanticTokens { result_id: None, data })))
+    }
 }
 
 /// Walk backward from `(line, col)` to find the identifier before the nearest
@@ -803,4 +1023,228 @@ fn find_enclosing_block_trigger(lines: &[&str], cursor_line: usize, cursor_col: 
         }
     }
     None
+}
+
+/// Expand selection outward from `pos` using brace structure.
+/// Returns a chain of nested SelectionRange: word → line → enclosing block → outer block → ...
+fn selection_range_at(lines: &[&str], pos: &Position) -> SelectionRange {
+    let li = pos.line as usize;
+    let ci = pos.character as usize;
+
+    // Innermost: word under cursor.
+    let line = lines.get(li).copied().unwrap_or("");
+    let word_range = if let Some((_, start, end)) = crate::symbols::word_at(line, ci) {
+        Range {
+            start: Position { line: pos.line, character: start as u32 },
+            end: Position { line: pos.line, character: end as u32 },
+        }
+    } else {
+        Range {
+            start: *pos,
+            end: Position { line: pos.line, character: ci.saturating_add(1) as u32 },
+        }
+    };
+
+    // Build enclosing brace ranges by walking backward/forward.
+    let mut ranges = vec![word_range];
+    // Line range.
+    let line_range = Range {
+        start: Position { line: pos.line, character: 0 },
+        end: Position { line: pos.line, character: line.len() as u32 },
+    };
+    if line_range != *ranges.last().unwrap() {
+        ranges.push(line_range);
+    }
+
+    // Enclosing brace ranges — up to 10 levels.
+    let mut stack: Vec<(usize, usize)> = Vec::new(); // (line, col) of each `{`
+
+    'outer: for (brace_li, brace_line) in lines.iter().enumerate() {
+        let char_iter: Vec<(usize, char)> = brace_line.char_indices().collect();
+        for (brace_ci, ch) in &char_iter {
+            // Only consider positions before cursor for `{`, after for `}`.
+            let before_cursor = brace_li < li || (brace_li == li && *brace_ci <= ci);
+            match ch {
+                '{' => {
+                    if before_cursor {
+                        stack.push((brace_li, *brace_ci));
+                    }
+                }
+                '}' => {
+                    if !before_cursor {
+                        if let Some((open_li, open_ci)) = stack.pop() {
+                            let r = Range {
+                                start: Position { line: open_li as u32, character: open_ci as u32 },
+                                end: Position { line: brace_li as u32, character: (brace_ci + 1) as u32 },
+                            };
+                            ranges.push(r);
+                            if ranges.len() >= 12 { break 'outer; }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    // Build linked chain from innermost to outermost.
+    ranges.dedup();
+    ranges.into_iter().rev().fold(None::<SelectionRange>, |parent, range| {
+        Some(SelectionRange {
+            range,
+            parent: parent.map(Box::new),
+        })
+    }).unwrap_or(SelectionRange { range: word_range, parent: None })
+}
+
+/// Build semantic token data for the full document.
+/// Token types: 0=keyword, 1=function, 2=variable, 3=string, 4=comment, 5=number
+/// Token modifiers: 0x1=definition
+fn build_semantic_tokens(
+    text: &str,
+    definitions: Option<&HashMap<String, (Location, String)>>,
+) -> Vec<SemanticToken> {
+    use std::sync::OnceLock;
+    use tiger_lib::all_builtin_entries;
+
+    static TRIGGER_SET: OnceLock<std::collections::HashSet<String>> = OnceLock::new();
+    let trigger_set = TRIGGER_SET.get_or_init(|| {
+        all_builtin_entries().into_iter().map(|e| e.name).collect()
+    });
+
+    let def_set: std::collections::HashSet<&str> = definitions
+        .map(|d| d.keys().map(|k| k.as_str()).collect())
+        .unwrap_or_default();
+
+    let mut tokens: Vec<SemanticToken> = Vec::new();
+    let mut prev_line = 0u32;
+    let mut prev_start = 0u32;
+
+    for (li, line) in text.lines().enumerate() {
+        let li = li as u32;
+        let trimmed = line.trim_start();
+
+        // Whole-line comment.
+        if trimmed.starts_with('#') {
+            let start = line.find('#').unwrap_or(0) as u32;
+            tokens.push(SemanticToken {
+                delta_line: li - prev_line,
+                delta_start: if li == prev_line { start - prev_start } else { start },
+                length: (line.len() - line.find('#').unwrap_or(0)) as u32,
+                token_type: 4, // comment
+                token_modifiers_bitset: 0,
+            });
+            prev_line = li;
+            prev_start = start;
+            continue;
+        }
+
+        // Scan tokens on the line.
+        let chars: Vec<(usize, char)> = line.char_indices().collect();
+        let mut char_pos = 0;
+
+        while char_pos < chars.len() {
+            let (byte_i, ch) = chars[char_pos];
+
+            // Skip to inline comment.
+            if ch == '#' { break; }
+
+            // Quoted string.
+            if ch == '"' {
+                let end = chars[char_pos+1..].iter()
+                    .find(|(_, c)| *c == '"')
+                    .map(|(i, _)| char_pos + 1 + chars[char_pos+1..].iter().position(|(bi, _)| *bi == *i + byte_i + 1).unwrap_or(0) + 1)
+                    .unwrap_or(chars.len());
+                let start = byte_i as u32;
+                let len = chars.get(end).map(|(bi, _)| *bi).unwrap_or(line.len()) as u32 - byte_i as u32;
+                if len > 0 {
+                    tokens.push(SemanticToken {
+                        delta_line: li - prev_line,
+                        delta_start: if li == prev_line { start - prev_start } else { start },
+                        length: len,
+                        token_type: 3, // string
+                        token_modifiers_bitset: 0,
+                    });
+                    prev_line = li;
+                    prev_start = start;
+                }
+                char_pos = end;
+                continue;
+            }
+
+            // Number literal.
+            if ch.is_ascii_digit() || (ch == '-' && chars.get(char_pos+1).map(|(_, c)| c.is_ascii_digit()).unwrap_or(false)) {
+                let num_start = byte_i;
+                let mut np = char_pos + 1;
+                while np < chars.len() && (chars[np].1.is_ascii_digit() || chars[np].1 == '.') {
+                    np += 1;
+                }
+                let num_end = chars.get(np).map(|(bi, _)| *bi).unwrap_or(line.len());
+                let start = num_start as u32;
+                let len = (num_end - num_start) as u32;
+                if len > 0 {
+                    tokens.push(SemanticToken {
+                        delta_line: li - prev_line,
+                        delta_start: if li == prev_line { start - prev_start } else { start },
+                        length: len,
+                        token_type: 5, // number
+                        token_modifiers_bitset: 0,
+                    });
+                    prev_line = li;
+                    prev_start = start;
+                }
+                char_pos = np;
+                continue;
+            }
+
+            // Identifier.
+            if ch.is_alphanumeric() || ch == '_' || ch == '@' {
+                let id_start = byte_i;
+                let mut np = char_pos + 1;
+                while np < chars.len() && (chars[np].1.is_alphanumeric() || chars[np].1 == '_' || chars[np].1 == '.' || chars[np].1 == ':') {
+                    np += 1;
+                }
+                let id_end = chars.get(np).map(|(bi, _)| *bi).unwrap_or(line.len());
+                let word = &line[id_start..id_end];
+
+                let (tok_type, modifier) = if word.starts_with('@') {
+                    (2u32, 0u32) // variable
+                } else if word == "yes" || word == "no" || word == "AND" || word == "OR"
+                    || word == "NOT" || word == "NOR" || word == "NAND"
+                    || word == "if" || word == "else" || word == "else_if"
+                    || word == "trigger_if" || word == "trigger_else" || word == "trigger_else_if"
+                    || word == "switch" || word == "limit"
+                {
+                    (0u32, 0u32) // keyword
+                } else if trigger_set.contains(word) {
+                    (1u32, 0u32) // function (builtin trigger/effect)
+                } else if def_set.contains(word) {
+                    // Check if this is a definition site (at column 0, before `=`)
+                    let is_def = byte_i == 0 || line[..byte_i].trim().is_empty();
+                    (1u32, if is_def { 1u32 } else { 0u32 }) // function ± definition modifier
+                } else {
+                    char_pos = np;
+                    continue;
+                };
+
+                let start = id_start as u32;
+                let len = (id_end - id_start) as u32;
+                tokens.push(SemanticToken {
+                    delta_line: li - prev_line,
+                    delta_start: if li == prev_line { start - prev_start } else { start },
+                    length: len,
+                    token_type: tok_type,
+                    token_modifiers_bitset: modifier,
+                });
+                prev_line = li;
+                prev_start = start;
+                char_pos = np;
+                continue;
+            }
+
+            char_pos += 1;
+        }
+    }
+
+    tokens
 }
