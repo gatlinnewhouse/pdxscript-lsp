@@ -26,6 +26,8 @@ use crate::symbols::{
 };
 use crate::validate::{DiagMap, HintMap, ValidateConfig, validate_mod};
 
+use tiger_lib;
+
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 struct Settings {
@@ -325,6 +327,7 @@ impl LanguageServer for Backend {
                         "$".to_owned(),
                         " ".to_owned(),
                         "=".to_owned(),
+                        ".".to_owned(),
                     ]),
                     ..Default::default()
                 }),
@@ -363,6 +366,14 @@ impl LanguageServer for Backend {
                         work_done_progress_options: Default::default(),
                     }),
                 ),
+                diagnostic_provider: Some(DiagnosticServerCapabilities::Options(
+                    DiagnosticOptions {
+                        identifier: Some("pdxscript-lsp".to_owned()),
+                        inter_file_dependencies: true,
+                        workspace_diagnostics: true,
+                        ..Default::default()
+                    },
+                )),
                 ..Default::default()
             },
             server_info: Some(ServerInfo {
@@ -716,9 +727,10 @@ impl LanguageServer for Backend {
         let uri = &params.text_document_position.text_document.uri;
         let path = match uri.to_file_path() { Ok(p) => p, Err(()) => return Ok(None) };
 
-        // When triggered by `$`, only return localization key completions.
         let trigger = params.context.as_ref()
             .and_then(|c| c.trigger_character.as_deref());
+
+        // `$` → only localization key completions.
         if trigger == Some("$") {
             let mut loca_items = Vec::new();
             if let Some(mod_root) = Self::find_mod_root(&path) {
@@ -735,6 +747,81 @@ impl LanguageServer for Backend {
                 is_incomplete: false,
                 items: loca_items,
             })));
+        }
+
+        // `.` → scope chain completions.
+        if trigger == Some(".") {
+            let items = crate::completions::scope_chain_completions();
+            return Ok(Some(CompletionResponse::List(CompletionList {
+                is_incomplete: false,
+                items,
+            })));
+        }
+
+        // Detect value context: cursor is after `keyword = `.
+        // If we recognise the keyword as taking a specific item type, return filtered completions.
+        let pos = &params.text_document_position.position;
+        let value_keyword: Option<String> = {
+            let docs = self.documents.read().await;
+            docs.get(uri).and_then(|text| {
+                let lines: Vec<&str> = text.lines().collect();
+                let line = lines.get(pos.line as usize).copied().unwrap_or("");
+                value_context_keyword(line, pos.character as usize)
+            })
+        };
+        if let Some(ref kw) = value_keyword {
+            if let Some(item_type) = tiger_lib::field_value_item(kw) {
+                // Gather only game_items matching this item_type from the mod index.
+                let mod_root = Self::find_mod_root(&path);
+                let mut filtered: Vec<CompletionItem> = Vec::new();
+                if let Some(ref root) = mod_root {
+                    if let Some(cached) = self.mod_completions.read().await.get(root) {
+                        // mod_completions contains pre-built items — re-filter from raw game_items
+                        // is not available here; fall through to full completions but mark the
+                        // item_type in the detail filter pass below.
+                        let _ = cached; // intentionally unused — we re-scan below
+                    }
+                }
+                // Re-scan for game_items filtered by item_type (fast, cached scan).
+                if let Some(root) = mod_root {
+                    let cfg = self.build_validate_config().await;
+                    let game_dir = cfg.as_ref().map(|c| c.game_dir.clone());
+                    let workshop_dir = cfg.as_ref().and_then(|c| c.workshop_dir.clone());
+                    let item_type_owned = item_type.to_owned();
+                    if let Ok(scan) = tokio::task::spawn_blocking(move || {
+                        scan_mod_items(&root, game_dir.as_deref(), workshop_dir.as_deref())
+                    })
+                    .await
+                    {
+                        for (name, subdir) in scan.game_items {
+                            // Match: item_type "building" matches subdir "buildings" or "building"
+                            if subdir == item_type_owned
+                                || subdir == format!("{item_type_owned}s")
+                                || subdir.starts_with(&item_type_owned)
+                            {
+                                filtered.push(CompletionItem {
+                                    label: name.clone(),
+                                    kind: Some(CompletionItemKind::ENUM_MEMBER),
+                                    detail: Some(subdir.clone()),
+                                    label_details: Some(CompletionItemLabelDetails {
+                                        detail: Some(format!(" {subdir}")),
+                                        description: None,
+                                    }),
+                                    insert_text: Some(name),
+                                    insert_text_format: Some(InsertTextFormat::PLAIN_TEXT),
+                                    ..Default::default()
+                                });
+                            }
+                        }
+                    }
+                }
+                if !filtered.is_empty() {
+                    return Ok(Some(CompletionResponse::List(CompletionList {
+                        is_incomplete: false,
+                        items: filtered,
+                    })));
+                }
+            }
         }
 
         let mut items = static_keywords();
@@ -797,6 +884,51 @@ impl LanguageServer for Backend {
         if let Ok(s) = serde_json::from_value::<Settings>(params.settings) {
             *self.settings.write().await = s;
         }
+    }
+
+    // ─── Pull diagnostic model (LSP 3.17) ───────────────────────────────────
+
+    /// `textDocument/diagnostic` — per-file pull diagnostics.
+    /// Returns the cached diagnostics for a single file from `self.published`.
+    async fn diagnostic(
+        &self,
+        params: DocumentDiagnosticParams,
+    ) -> LspResult<DocumentDiagnosticReportResult> {
+        let uri = &params.text_document.uri;
+        let published = self.published.lock().await;
+        let items = published.get(uri).cloned().unwrap_or_default();
+        Ok(DocumentDiagnosticReportResult::Report(
+            DocumentDiagnosticReport::Full(RelatedFullDocumentDiagnosticReport {
+                full_document_diagnostic_report: FullDocumentDiagnosticReport {
+                    result_id: None,
+                    items,
+                },
+                related_documents: None,
+            }),
+        ))
+    }
+
+    /// `workspace/diagnostic` — whole-workspace pull diagnostics.
+    /// Returns all cached per-file diagnostics from `self.published`.
+    async fn workspace_diagnostic(
+        &self,
+        _params: WorkspaceDiagnosticParams,
+    ) -> LspResult<WorkspaceDiagnosticReportResult> {
+        let published = self.published.lock().await;
+        let items: Vec<WorkspaceDocumentDiagnosticReport> = published
+            .iter()
+            .map(|(uri, diags)| {
+                WorkspaceDocumentDiagnosticReport::Full(WorkspaceFullDocumentDiagnosticReport {
+                    uri: uri.clone(),
+                    version: None,
+                    full_document_diagnostic_report: FullDocumentDiagnosticReport {
+                        result_id: None,
+                        items: diags.clone(),
+                    },
+                })
+            })
+            .collect();
+        Ok(WorkspaceDiagnosticReportResult::Report(WorkspaceDiagnosticReport { items }))
     }
 
     // ─── Document Highlight ──────────────────────────────────────────────────
@@ -1247,4 +1379,42 @@ fn build_semantic_tokens(
     }
 
     tokens
+}
+
+/// Detect if the cursor is in a VALUE position on the current line: `keyword = <cursor>`.
+/// Returns the keyword name if so, `None` otherwise.
+///
+/// Matches patterns like:
+///   `add_building = |`         → Some("add_building")
+///   `has_trait = |`            → Some("has_trait")
+///   `add_building=|`           → Some("add_building")
+/// Does NOT match:
+///   `add_building = { |`       → None (cursor inside block, not bare value)
+fn value_context_keyword(line: &str, col: usize) -> Option<String> {
+    let before = &line[..col.min(line.len())];
+    // The text before cursor must end with `= ` (optional spaces) after a keyword.
+    // Accept optional whitespace between keyword and `=` and between `=` and cursor.
+    let trimmed = before.trim_end();
+    // If we just typed `=` or are right after `= `, the trimmed end is `=` or the spaces were trimmed.
+    let (keyword_part, rest_after_eq) = if let Some(pos) = trimmed.rfind('=') {
+        let after_eq = &trimmed[pos+1..].trim();
+        // If there's a `{` after `=`, we're inside a block — bail.
+        if after_eq.contains('{') { return None; }
+        (&trimmed[..pos], *after_eq)
+    } else {
+        // No `=` before cursor — not a value context.
+        return None;
+    };
+    // After `=` there should be nothing (cursor right after `=`) or whitespace (value position).
+    // But if there's already a word started (non-empty rest), the user is mid-typing — still valid.
+    let _ = rest_after_eq; // cursor is in value position regardless of partial word
+    let keyword = keyword_part.trim().split(|c: char| c.is_whitespace()).last()
+        .filter(|s| !s.is_empty())
+        .map(|s| s.trim_start_matches(|c: char| !c.is_alphanumeric() && c != '_'))?;
+    // Must be a valid identifier.
+    if keyword.chars().all(|c| c.is_alphanumeric() || c == '_') && !keyword.is_empty() {
+        Some(keyword.to_owned())
+    } else {
+        None
+    }
 }

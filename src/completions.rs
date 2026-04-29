@@ -10,7 +10,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use tiger_lib::{LspEntryKind, all_builtin_entries};
+use tiger_lib::{LspEntryKind, all_builtin_entries, scope_chain_entries};
 use tower_lsp::lsp_types::{
     CompletionItem, CompletionItemKind, CompletionItemLabelDetails, InsertTextFormat,
 };
@@ -95,6 +95,35 @@ pub fn builtin_completions() -> &'static [CompletionItem] {
             })
             .collect()
     })
+}
+
+// ─── Tier 1c: Scope chain navigation ─────────────────────────────────────────
+
+/// All built-in scope navigation steps (used when completion triggered by `.`).
+/// Each item shows the navigation keyword with `→ ToScope` in labelDetails.
+pub fn scope_chain_completions() -> Vec<CompletionItem> {
+    use std::sync::OnceLock;
+    static CACHE: OnceLock<Vec<CompletionItem>> = OnceLock::new();
+    CACHE.get_or_init(|| {
+        scope_chain_entries()
+            .into_iter()
+            .map(|e| {
+                let detail = format!("{} → {}", e.from_scope, e.to_scope);
+                CompletionItem {
+                    label: e.name.to_owned(),
+                    kind: Some(CompletionItemKind::PROPERTY),
+                    detail: Some(detail.clone()),
+                    label_details: Some(CompletionItemLabelDetails {
+                        detail: Some(format!(" → {}", e.to_scope)),
+                        description: Some(e.from_scope),
+                    }),
+                    insert_text: Some(e.name.to_owned()),
+                    insert_text_format: Some(InsertTextFormat::PLAIN_TEXT),
+                    ..Default::default()
+                }
+            })
+            .collect()
+    }).clone()
 }
 
 // ─── Tier 2: @variable names from document text ───────────────────────────────
