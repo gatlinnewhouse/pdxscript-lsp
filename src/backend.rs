@@ -861,22 +861,37 @@ impl LanguageServer for Backend {
         }
 
         // Block-field completions: when cursor is inside `trigger_name = { <cursor> }`,
-        // offer the expected field names from tiger's block schema.
+        // offer either scope-filtered entries (Iterator blocks) or expected field names.
         if value_keyword.is_none() {
-            let block_fields: Option<Vec<tiger_lib::SchemaField>> = {
+            let block_schema: Option<(String, Vec<tiger_lib::SchemaField>)> = {
                 let docs = self.documents.read().await;
                 if let Some(text) = docs.get(uri) {
                     let lines: Vec<&str> = text.lines().collect();
                     let cursor_line = pos.line as usize;
                     let cursor_col  = pos.character as usize;
                     find_enclosing_block_trigger(&lines, cursor_line, cursor_col)
-                        .and_then(|name| tiger_lib::block_schema(&name))
+                        .and_then(|name| {
+                            tiger_lib::block_schema(&name).map(|fields| (name, fields))
+                        })
                 } else {
                     None
                 }
             };
-            if let Some(fields) = block_fields {
-                if !fields.is_empty() {
+            if let Some((block_name, fields)) = block_schema {
+                // Iterator block: single virtual "scope" field → return scope-filtered completions.
+                let is_iterator = fields.len() == 1 && fields[0].name == "scope";
+                if is_iterator {
+                    let scope_hint = fields[0].type_hint.clone();
+                    let entries = tiger_lib::entries_for_scope(&scope_hint);
+                    if !entries.is_empty() {
+                        let scope_items = lsp_entries_to_completions(entries, &block_name);
+                        return Ok(Some(CompletionResponse::List(CompletionList {
+                            is_incomplete: false,
+                            items: scope_items,
+                        })));
+                    }
+                } else if !fields.is_empty() {
+                    // Fixed-schema block: offer field names.
                     let field_items: Vec<CompletionItem> = fields.iter().map(|f| CompletionItem {
                         label: f.name.clone(),
                         kind: Some(CompletionItemKind::FIELD),
@@ -894,6 +909,7 @@ impl LanguageServer for Backend {
                         items: field_items,
                     })));
                 }
+                // fields.is_empty() → custom validator block: fall through to generic completions.
             }
         }
 
@@ -1651,6 +1667,26 @@ fn value_context_keyword(line: &str, col: usize) -> Option<String> {
     } else {
         None
     }
+}
+
+/// Convert `LspEntry` list to `CompletionItem`s. `context` is used to build the detail string.
+fn lsp_entries_to_completions(entries: Vec<tiger_lib::LspEntry>, context: &str) -> Vec<CompletionItem> {
+    use tiger_lib::LspEntryKind;
+    entries.into_iter().map(|e| {
+        let (kind, detail) = match e.kind {
+            LspEntryKind::Trigger  => (CompletionItemKind::EVENT, format!("trigger (scope: {context})")),
+            LspEntryKind::Effect   => (CompletionItemKind::FUNCTION, format!("effect (scope: {context})")),
+            LspEntryKind::Iterator => (CompletionItemKind::KEYWORD, format!("iterator (scope: {context})")),
+        };
+        CompletionItem {
+            label: e.name.clone(),
+            kind: Some(kind),
+            detail: Some(detail),
+            insert_text: Some(e.name),
+            insert_text_format: Some(InsertTextFormat::PLAIN_TEXT),
+            ..Default::default()
+        }
+    }).collect()
 }
 
 // ─── Document Color helpers ──────────────────────────────────────────────────

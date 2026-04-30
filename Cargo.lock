@@ -1491,7 +1491,7 @@ dependencies = [
 [[package]]
 name = "tiger-lib"
 version = "1.18.0"
-source = "git+https://github.com/gatlinnewhouse/tiger?branch=lsp_wip#b35bfb3e0158fcc8eb2b5c5aecd872106a78d762"
+source = "git+https://github.com/gatlinnewhouse/tiger?branch=lsp_wip#7076c8775eb6382606504345699eb2b234835854"
 dependencies = [
  "ahash",
  "ansiterm",
@@ -1528,7 +1528,7 @@ dependencies = [
 [[package]]
 name = "tiger-tables"
 version = "1.18.0"
-source = "git+https://github.com/gatlinnewhouse/tiger?branch=lsp_wip#b35bfb3e0158fcc8eb2b5c5aecd872106a78d762"
+source = "git+https://github.com/gatlinnewhouse/tiger?branch=lsp_wip#7076c8775eb6382606504345699eb2b234835854"
 dependencies = [
  "anyhow",
  "phf",
