@@ -833,6 +833,25 @@ impl LanguageServer for Backend {
             }
         }
 
+        // Choice completions: static string lists defined in tiger (e.g. has_government = oligarchy).
+        if let Some(ref kw) = value_keyword {
+            if let Some(choices) = tiger_lib::field_value_choices(kw) {
+                let items: Vec<CompletionItem> = choices.iter().map(|c| CompletionItem {
+                    label: c.to_string(),
+                    kind: Some(CompletionItemKind::ENUM_MEMBER),
+                    insert_text: Some(c.to_string()),
+                    insert_text_format: Some(InsertTextFormat::PLAIN_TEXT),
+                    ..Default::default()
+                }).collect();
+                if !items.is_empty() {
+                    return Ok(Some(CompletionResponse::List(CompletionList {
+                        is_incomplete: false,
+                        items,
+                    })));
+                }
+            }
+        }
+
         let mut items = static_keywords();
         items.extend_from_slice(builtin_completions());
 

@@ -189,10 +189,10 @@ pub fn validate_mod(mod_root: &Path, cfg: &ValidateConfig) -> Result<(DiagMap, H
         };
         if ann.loc.line == 0 { continue; }
         let LspAnnotationKind::Scope(scope_str) = ann.kind;
-        // Show scope at start of the block line (column 0 of that line).
+        // Place hint at end of line (u32::MAX; clients clip to EOL).
         let pos = Position {
             line: ann.loc.line.saturating_sub(1),
-            character: 0,
+            character: u32::MAX,
         };
         let hint = InlayHint {
             position: pos,
@@ -200,8 +200,8 @@ pub fn validate_mod(mod_root: &Path, cfg: &ValidateConfig) -> Result<(DiagMap, H
             kind: Some(InlayHintKind::TYPE),
             text_edits: None,
             tooltip: None,
-            padding_left: Some(false),
-            padding_right: Some(true),
+            padding_left: Some(true),
+            padding_right: Some(false),
             data: None,
         };
         hint_map.entry(uri).or_default().push(hint);
