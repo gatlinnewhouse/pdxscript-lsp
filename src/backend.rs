@@ -48,6 +48,8 @@ pub struct Backend {
     /// Definition locations + detail for scripted items per mod root.
     /// Value: (Location, detail_str) where detail is "scripted_effect", "event", etc.
     mod_definitions: RwLock<HashMap<PathBuf, HashMap<String, (Location, String)>>>,
+    /// HOI4 flag names collected from set_*_flag effects, per mod root.
+    mod_flags: RwLock<HashMap<PathBuf, Vec<String>>>,
     /// Scope inlay hints per file URI, collected from tiger-lib scope annotations.
     inlay_hints: RwLock<HintMap>,
 }
@@ -62,6 +64,7 @@ impl Backend {
             documents: RwLock::new(HashMap::new()),
             mod_completions: RwLock::new(HashMap::new()),
             mod_definitions: RwLock::new(HashMap::new()),
+            mod_flags: RwLock::new(HashMap::new()),
             inlay_hints: RwLock::new(HashMap::new()),
         }
     }
@@ -163,11 +166,13 @@ impl Backend {
         .unwrap_or_default();
 
         let raw_defs = scan.definitions.clone();
+        let flags = scan.flags.clone();
         let completions = scan.into_completion_items();
         let definitions = defs_to_locations(raw_defs);
 
         self.mod_completions.write().await.insert(mod_root.clone(), completions);
-        self.mod_definitions.write().await.insert(mod_root, definitions);
+        self.mod_definitions.write().await.insert(mod_root.clone(), definitions);
+        self.mod_flags.write().await.insert(mod_root, flags);
     }
 
     async fn publish_tiger_diagnostics(&self, mut new_map: DiagMap) {
@@ -860,6 +865,30 @@ impl LanguageServer for Backend {
             }
         }
 
+        // Flag completions: HOI4 triggers that take a flag name (Trigger::Flag / FlagOrBlock).
+        if let Some(ref kw) = value_keyword {
+            if tiger_lib::field_is_flag(kw) {
+                if let Some(mod_root) = Self::find_mod_root(&path) {
+                    if let Some(flags) = self.mod_flags.read().await.get(&mod_root) {
+                        let flag_items: Vec<CompletionItem> = flags.iter().map(|f| CompletionItem {
+                            label: f.clone(),
+                            kind: Some(CompletionItemKind::ENUM_MEMBER),
+                            detail: Some("flag".to_owned()),
+                            insert_text: Some(f.clone()),
+                            insert_text_format: Some(InsertTextFormat::PLAIN_TEXT),
+                            ..Default::default()
+                        }).collect();
+                        if !flag_items.is_empty() {
+                            return Ok(Some(CompletionResponse::List(CompletionList {
+                                is_incomplete: false,
+                                items: flag_items,
+                            })));
+                        }
+                    }
+                }
+            }
+        }
+
         // Block-field completions: when cursor is inside `trigger_name = { <cursor> }`,
         // offer either scope-filtered entries (Iterator blocks) or expected field names.
         if value_keyword.is_none() {
@@ -939,10 +968,12 @@ impl LanguageServer for Backend {
                 .await
                 {
                     let raw_defs = scan.definitions.clone();
+                    let flags = scan.flags.clone();
                     let scanned = scan.into_completion_items();
                     let definitions = defs_to_locations(raw_defs);
                     self.mod_completions.write().await.insert(mod_root.clone(), scanned.clone());
-                    self.mod_definitions.write().await.insert(mod_root, definitions);
+                    self.mod_definitions.write().await.insert(mod_root.clone(), definitions);
+                    self.mod_flags.write().await.insert(mod_root.clone(), flags);
                     items.extend(scanned);
                 }
             }

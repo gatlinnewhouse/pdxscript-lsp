@@ -243,6 +243,8 @@ pub struct ModItems {
     /// Definition locations: item name → (absolute path, 1-based line, detail).
     /// detail is one of: "scripted_effect", "scripted_trigger", "scripted_modifier", "event".
     pub definitions: std::collections::HashMap<String, (std::path::PathBuf, u32, String)>,
+    /// HOI4 flag names collected from set_*_flag effects across all script files.
+    pub flags: Vec<String>,
 }
 
 impl ModItems {
@@ -392,6 +394,8 @@ fn scan_single_mod(root: &Path) -> ModItems {
     let icons = collect_icon_names(root);
     let game_items = collect_game_item_names(root);
 
+    let flags = scan_flag_names_in_tree(root);
+
     ModItems {
         scripted_effects:  effects_locs.into_iter().map(|(n, _, _)| n).collect(),
         scripted_triggers: triggers_locs.into_iter().map(|(n, _, _)| n).collect(),
@@ -401,6 +405,7 @@ fn scan_single_mod(root: &Path) -> ModItems {
         icons,
         game_items,
         definitions,
+        flags,
     }
 }
 
@@ -439,6 +444,7 @@ fn merge_items(dst: &mut ModItems, src: ModItems) {
     dst.at_variables.extend(src.at_variables);
     dst.icons.extend(src.icons);
     dst.game_items.extend(src.game_items);
+    dst.flags.extend(src.flags);
     for (k, v) in src.definitions {
         // Mod definitions take precedence over dependency/game definitions.
         dst.definitions.entry(k).or_insert(v);
@@ -453,6 +459,7 @@ fn dedup_items(items: &mut ModItems) {
         &mut items.events,
         &mut items.at_variables,
         &mut items.icons,
+        &mut items.flags,
     ] {
         v.sort_unstable();
         v.dedup();
@@ -597,6 +604,49 @@ fn scan_at_variables_in_dir(dir: &Path, out: &mut Vec<String>) {
             }
         }
     }
+}
+
+/// Scan all `.txt` files for HOI4 `set_*_flag = name` patterns and collect the flag names.
+fn scan_flag_names_in_tree(root: &Path) -> Vec<String> {
+    let mut names = Vec::new();
+    for subdir in &["common", "events", "history", "national_focus", "decisions", "scripted_guis"] {
+        scan_flag_names_in_dir(&root.join(subdir), &mut names);
+    }
+    names.sort_unstable();
+    names.dedup();
+    names
+}
+
+fn scan_flag_names_in_dir(dir: &Path, out: &mut Vec<String>) {
+    let Ok(entries) = fs::read_dir(dir) else { return };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            scan_flag_names_in_dir(&path, out);
+        } else if path.extension().and_then(|e| e.to_str()) == Some("txt") {
+            let Ok(text) = fs::read_to_string(&path) else { continue };
+            for line in text.lines() {
+                if let Some(flag) = parse_flag_set(line) {
+                    out.push(flag.to_owned());
+                }
+            }
+        }
+    }
+}
+
+/// Match lines of the form `set_*_flag = flag_name` and return the flag name.
+fn parse_flag_set(line: &str) -> Option<&str> {
+    let trimmed = line.trim();
+    // Accept set_country_flag, set_global_flag, set_state_flag, set_unit_leader_flag, etc.
+    let kw_end = trimmed.find('=')?;
+    let kw = trimmed[..kw_end].trim();
+    if !kw.starts_with("set_") || !kw.ends_with("_flag") { return None; }
+    let rhs = trimmed[kw_end + 1..].trim();
+    // Value must be a bare identifier (no '{' or '#').
+    if rhs.contains('{') || rhs.starts_with('#') || rhs.is_empty() { return None; }
+    // Strip inline comment if any.
+    let flag = rhs.split_whitespace().next()?;
+    Some(flag)
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
