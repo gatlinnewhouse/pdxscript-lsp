@@ -495,6 +495,32 @@ impl LanguageServer for Backend {
             }
         }
 
+        // Block-field hover: if word matches a field in the enclosing block's schema, show type.
+        {
+            let docs = self.documents.read().await;
+            if let Some(text) = docs.get(uri) {
+                let lines: Vec<&str> = text.lines().collect();
+                if let Some(block_name) = find_enclosing_block_trigger(&lines, pos.line as usize, pos.character as usize) {
+                    if let Some(fields) = tiger_lib::block_schema(&block_name) {
+                        if let Some(field) = fields.iter().find(|f| f.name == word) {
+                            let req = if field.required { "required" } else { "optional" };
+                            let content = format!(
+                                "**{word}** — `{}` ({req})\n\nField of `{block_name}`",
+                                field.type_hint
+                            );
+                            return Ok(Some(Hover {
+                                contents: HoverContents::Markup(MarkupContent {
+                                    kind: MarkupKind::Markdown,
+                                    value: content,
+                                }),
+                                range: None,
+                            }));
+                        }
+                    }
+                }
+            }
+        }
+
         Ok(hover_builtin(&word))
     }
 
