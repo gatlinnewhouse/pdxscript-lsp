@@ -112,10 +112,16 @@ impl Backend {
                 return;
             }
         };
-        let cfg = match self.build_validate_config().await {
+        let mut cfg = match self.build_validate_config().await {
             Some(c) => c,
             None => return,
         };
+        // Pass the game-specific tiger conf so load_config_filtering_rules() reads
+        // show_vanilla / show_loaded_mods and any trigger-based filter rules.
+        let conf_path = mod_root.join(TIGER_CONF);
+        if conf_path.exists() {
+            cfg.config_file = Some(conf_path);
+        }
 
         let _permit = match self.validation_semaphore.acquire().await {
             Ok(p) => p,
@@ -376,6 +382,9 @@ impl LanguageServer for Backend {
                         ..Default::default()
                     },
                 )),
+                call_hierarchy_provider: Some(CallHierarchyServerCapability::Simple(true)),
+                color_provider: Some(ColorProviderCapability::Simple(true)),
+                inline_value_provider: Some(OneOf::Left(true)),
                 ..Default::default()
             },
             server_info: Some(ServerInfo {
@@ -1114,6 +1123,122 @@ impl LanguageServer for Backend {
         if data.is_empty() { return Ok(None); }
         Ok(Some(SemanticTokensResult::Tokens(SemanticTokens { result_id: None, data })))
     }
+
+    // ─── Call Hierarchy ──────────────────────────────────────────────────────
+
+    async fn prepare_call_hierarchy(
+        &self,
+        params: CallHierarchyPrepareParams,
+    ) -> LspResult<Option<Vec<CallHierarchyItem>>> {
+        let uri = &params.text_document_position_params.text_document.uri;
+        let docs = self.documents.read().await;
+        let text = match docs.get(uri) { Some(t) => t.clone(), None => return Ok(None) };
+        drop(docs);
+
+        let path = match uri.to_file_path() { Ok(p) => p, Err(()) => return Ok(None) };
+        let mod_root = match Self::find_mod_root(&path) { Some(r) => r, None => return Ok(None) };
+        let defs = self.mod_definitions.read().await;
+        let definitions = match defs.get(&mod_root) { Some(d) => d.clone(), None => return Ok(None) };
+        drop(defs);
+
+        Ok(crate::call_hierarchy::prepare(&params, &text, &definitions))
+    }
+
+    async fn incoming_calls(
+        &self,
+        params: CallHierarchyIncomingCallsParams,
+    ) -> LspResult<Option<Vec<CallHierarchyIncomingCall>>> {
+        let uri = &params.item.uri;
+        let path = match uri.to_file_path() { Ok(p) => p, Err(()) => return Ok(None) };
+        let mod_root = match Self::find_mod_root(&path) { Some(r) => r, None => return Ok(None) };
+        let defs = self.mod_definitions.read().await;
+        let definitions = match defs.get(&mod_root) { Some(d) => d.clone(), None => return Ok(None) };
+        drop(defs);
+        let roots = self.search_roots(&mod_root).await;
+
+        let calls = tokio::task::spawn_blocking(move || {
+            crate::call_hierarchy::incoming_calls(&params, &definitions, &roots)
+        })
+        .await
+        .unwrap_or_default();
+
+        Ok(if calls.is_empty() { None } else { Some(calls) })
+    }
+
+    async fn outgoing_calls(
+        &self,
+        params: CallHierarchyOutgoingCallsParams,
+    ) -> LspResult<Option<Vec<CallHierarchyOutgoingCall>>> {
+        let uri = &params.item.uri;
+        let docs = self.documents.read().await;
+        let text = match docs.get(uri) { Some(t) => t.clone(), None => return Ok(None) };
+        drop(docs);
+
+        let path = match uri.to_file_path() { Ok(p) => p, Err(()) => return Ok(None) };
+        let mod_root = match Self::find_mod_root(&path) { Some(r) => r, None => return Ok(None) };
+        let defs = self.mod_definitions.read().await;
+        let definitions = match defs.get(&mod_root) { Some(d) => d.clone(), None => return Ok(None) };
+        drop(defs);
+
+        let calls = crate::call_hierarchy::outgoing_calls(&params, &text, &definitions);
+        Ok(if calls.is_empty() { None } else { Some(calls) })
+    }
+
+    // ─── Document Color ──────────────────────────────────────────────────────
+
+    async fn document_color(
+        &self,
+        params: DocumentColorParams,
+    ) -> LspResult<Vec<ColorInformation>> {
+        let uri = &params.text_document.uri;
+        let docs = self.documents.read().await;
+        let text = match docs.get(uri) { Some(t) => t.clone(), None => return Ok(vec![]) };
+        drop(docs);
+        Ok(extract_document_colors(&text))
+    }
+
+    async fn color_presentation(
+        &self,
+        params: ColorPresentationParams,
+    ) -> LspResult<Vec<ColorPresentation>> {
+        let c = &params.color;
+        let r = (c.red * 255.0).round() as u8;
+        let g = (c.green * 255.0).round() as u8;
+        let b = (c.blue * 255.0).round() as u8;
+        Ok(vec![
+            ColorPresentation {
+                label: format!("rgb {{ {r} {g} {b} }}"),
+                text_edit: Some(TextEdit {
+                    range: params.range,
+                    new_text: format!("rgb {{ {r} {g} {b} }}"),
+                }),
+                additional_text_edits: None,
+            },
+            ColorPresentation {
+                label: format!("hsv {{ {:.3} {:.3} {:.3} }}", c.red, c.green, c.blue),
+                text_edit: Some(TextEdit {
+                    range: params.range,
+                    new_text: format!("hsv {{ {:.3} {:.3} {:.3} }}", c.red, c.green, c.blue),
+                }),
+                additional_text_edits: None,
+            },
+        ])
+    }
+
+    // ─── Inline Values ───────────────────────────────────────────────────────
+
+    async fn inline_value(
+        &self,
+        params: InlineValueParams,
+    ) -> LspResult<Option<Vec<InlineValue>>> {
+        let uri = &params.text_document.uri;
+        let docs = self.documents.read().await;
+        let text = match docs.get(uri) { Some(t) => t.clone(), None => return Ok(None) };
+        drop(docs);
+
+        let values = extract_inline_values(&text, &params.range);
+        Ok(if values.is_empty() { None } else { Some(values) })
+    }
 }
 
 /// Walk backward from `(line, col)` to find the identifier before the nearest
@@ -1458,4 +1583,163 @@ fn value_context_keyword(line: &str, col: usize) -> Option<String> {
     } else {
         None
     }
+}
+
+// ─── Document Color helpers ──────────────────────────────────────────────────
+
+/// Scan text for PDX color patterns and return ColorInformation entries.
+///
+/// Supported patterns:
+///   `rgb { R G B }`          — components 0–255
+///   `rgb { R G B A }`        — components 0–255 (alpha ignored in LSP Color)
+///   `hsv { H S V }`          — H 0-360 or 0-1, S/V 0-1
+///   `color = { R G B }`      — same as rgb
+fn extract_document_colors(text: &str) -> Vec<ColorInformation> {
+    let mut out = Vec::new();
+    for (li, line) in text.lines().enumerate() {
+        let effective = match line.split('#').next() { Some(s) => s, None => continue };
+        // Match `rgb {`, `hsv {`, or `color = {` or `color1 = {` etc.
+        let lower = effective.to_lowercase();
+        for (prefix_len, is_hsv) in find_color_prefix_positions(&lower) {
+            let rest = &effective[prefix_len..];
+            if let Some((r, g, b, end_offset)) = parse_color_triple(rest) {
+                let col_start = prefix_len as u32;
+                let col_end = (prefix_len + end_offset) as u32;
+                let color = if is_hsv {
+                    // H is 0–360, S/V are 0–1; map to 0-1 range for LSP
+                    Color {
+                        red: (r / 360.0_f32).clamp(0.0, 1.0),
+                        green: g.clamp(0.0, 1.0),
+                        blue: b.clamp(0.0, 1.0),
+                        alpha: 1.0,
+                    }
+                } else {
+                    Color {
+                        red: (r / 255.0_f32).clamp(0.0, 1.0),
+                        green: (g / 255.0_f32).clamp(0.0, 1.0),
+                        blue: (b / 255.0_f32).clamp(0.0, 1.0),
+                        alpha: 1.0,
+                    }
+                };
+                out.push(ColorInformation {
+                    range: Range {
+                        start: Position { line: li as u32, character: col_start },
+                        end: Position { line: li as u32, character: col_end },
+                    },
+                    color,
+                });
+            }
+        }
+    }
+    out
+}
+
+/// Returns (byte_offset_after_brace, is_hsv) for each `rgb {` / `hsv {` / `color = {` found.
+fn find_color_prefix_positions(lower: &str) -> Vec<(usize, bool)> {
+    let mut results = Vec::new();
+    for (i, _) in lower.match_indices("rgb") {
+        let after = lower[i + 3..].trim_start();
+        if after.starts_with('{') {
+            let offset = i + 3 + lower[i + 3..].len() - after.len() + 1;
+            results.push((offset, false));
+        }
+    }
+    for (i, _) in lower.match_indices("hsv") {
+        let after = lower[i + 3..].trim_start();
+        if after.starts_with('{') {
+            let offset = i + 3 + lower[i + 3..].len() - after.len() + 1;
+            results.push((offset, true));
+        }
+    }
+    results
+}
+
+/// Parse up to 3 whitespace-separated floats/ints from text (stops at `}` or end).
+fn parse_color_triple(s: &str) -> Option<(f32, f32, f32, usize)> {
+    let mut nums = Vec::with_capacity(3);
+    let mut offset = 0usize;
+    let bytes = s.as_bytes();
+
+    while nums.len() < 3 && offset < s.len() {
+        // Skip whitespace.
+        while offset < s.len() && bytes[offset].is_ascii_whitespace() { offset += 1; }
+        if offset >= s.len() || bytes[offset] == b'}' { break; }
+        // Read number token.
+        let start = offset;
+        while offset < s.len() && (bytes[offset].is_ascii_digit() || bytes[offset] == b'.' || bytes[offset] == b'-') {
+            offset += 1;
+        }
+        if offset == start { break; }
+        if let Ok(v) = s[start..offset].parse::<f32>() {
+            nums.push(v);
+        }
+    }
+    // Skip to closing `}`.
+    while offset < s.len() && bytes[offset] != b'}' { offset += 1; }
+    if offset < s.len() { offset += 1; } // consume `}`
+
+    if nums.len() == 3 {
+        Some((nums[0], nums[1], nums[2], offset))
+    } else {
+        None
+    }
+}
+
+// ─── Inline Value helpers ────────────────────────────────────────────────────
+
+/// Return inline values for @variable definitions visible in the requested range.
+/// For each `@var = expr` definition in the document, show the expression value
+/// at every use site of `@var` within the range.
+fn extract_inline_values(text: &str, range: &Range) -> Vec<InlineValue> {
+    // Collect all @var = value definitions in document.
+    let mut defs: HashMap<String, String> = HashMap::new();
+    for line in text.lines() {
+        let t = line.trim_start();
+        if let Some(rest) = t.strip_prefix('@') {
+            if let Some(eq_pos) = rest.find('=') {
+                let name = rest[..eq_pos].trim().to_owned();
+                let value = rest[eq_pos + 1..].split('#').next().unwrap_or("").trim().to_owned();
+                if !name.is_empty() && !value.is_empty() {
+                    defs.insert(format!("@{name}"), value);
+                }
+            }
+        }
+    }
+    if defs.is_empty() { return vec![]; }
+
+    let mut out = Vec::new();
+    for (li, line) in text.lines().enumerate() {
+        let li_u32 = li as u32;
+        if li_u32 < range.start.line || li_u32 > range.end.line { continue; }
+
+        let effective = line.split('#').next().unwrap_or(line);
+        let mut ci = 0usize;
+        let bytes = effective.as_bytes();
+        while ci < effective.len() {
+            if bytes[ci] == b'@' {
+                let start = ci;
+                ci += 1;
+                while ci < effective.len() && (bytes[ci].is_ascii_alphanumeric() || bytes[ci] == b'_') {
+                    ci += 1;
+                }
+                let word = &effective[start..ci];
+                if let Some(val) = defs.get(word) {
+                    // Skip the definition line itself.
+                    let is_def = effective.trim_start().starts_with(word);
+                    if !is_def {
+                        out.push(InlineValue::Text(InlineValueText {
+                            range: Range {
+                                start: Position { line: li_u32, character: start as u32 },
+                                end: Position { line: li_u32, character: ci as u32 },
+                            },
+                            text: format!("{word} = {val}"),
+                        }));
+                    }
+                }
+            } else {
+                ci += 1;
+            }
+        }
+    }
+    out
 }

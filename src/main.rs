@@ -1,4 +1,5 @@
 mod backend;
+mod call_hierarchy;
 mod completions;
 mod demorgan;
 mod fold;
