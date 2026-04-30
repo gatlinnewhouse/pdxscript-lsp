@@ -637,26 +637,34 @@ impl LanguageServer for Backend {
         let fields = match schema { Some(f) => f, None => return Ok(None) };
 
         // Build parameter list: "required_field: type" or "?optional_field: type"
-        let params_info: Vec<ParameterInformation> = fields.iter().map(|f| {
-            let label = if f.required {
-                format!("{}: {}", f.name, f.type_hint)
-            } else {
-                format!("?{}: {}", f.name, f.type_hint)
-            };
-            ParameterInformation {
-                label: ParameterLabel::Simple(label),
-                documentation: None,
-            }
-        }).collect();
-
-        let param_list = fields.iter().map(|f| {
-            if f.required { format!("{}: {}", f.name, f.type_hint) }
-            else { format!("?{}: {}", f.name, f.type_hint) }
-        }).collect::<Vec<_>>().join("  |  ");
+        let (params_info, param_list, documentation) = if fields.is_empty() {
+            // Custom validator (Vb/Vbc/Vbv): takes a block but has no static schema.
+            (
+                vec![],
+                "...".to_owned(),
+                Some(Documentation::String(
+                    "Custom validator — no static schema available. Consult game documentation.".to_owned(),
+                )),
+            )
+        } else {
+            let pi: Vec<ParameterInformation> = fields.iter().map(|f| {
+                let label = if f.required {
+                    format!("{}: {}", f.name, f.type_hint)
+                } else {
+                    format!("?{}: {}", f.name, f.type_hint)
+                };
+                ParameterInformation { label: ParameterLabel::Simple(label), documentation: None }
+            }).collect();
+            let pl = fields.iter().map(|f| {
+                if f.required { format!("{}: {}", f.name, f.type_hint) }
+                else { format!("?{}: {}", f.name, f.type_hint) }
+            }).collect::<Vec<_>>().join("  |  ");
+            (pi, pl, None)
+        };
 
         let sig = SignatureInformation {
             label: format!("{name} = {{ {param_list} }}"),
-            documentation: None,
+            documentation,
             parameters: Some(params_info),
             active_parameter: None,
         };
