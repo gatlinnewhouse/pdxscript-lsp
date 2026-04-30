@@ -350,12 +350,14 @@ impl LanguageServer for Backend {
                     SemanticTokensServerCapabilities::SemanticTokensOptions(SemanticTokensOptions {
                         legend: SemanticTokensLegend {
                             token_types: vec![
-                                SemanticTokenType::KEYWORD,
-                                SemanticTokenType::FUNCTION,
-                                SemanticTokenType::VARIABLE,
-                                SemanticTokenType::STRING,
-                                SemanticTokenType::COMMENT,
-                                SemanticTokenType::NUMBER,
+                                SemanticTokenType::KEYWORD,   // 0
+                                SemanticTokenType::FUNCTION,  // 1
+                                SemanticTokenType::VARIABLE,  // 2
+                                SemanticTokenType::STRING,    // 3
+                                SemanticTokenType::COMMENT,   // 4
+                                SemanticTokenType::NUMBER,    // 5
+                                SemanticTokenType::NAMESPACE, // 6 — prefix in prefix:value
+                                SemanticTokenType::ENUM_MEMBER, // 7 — value in prefix:value
                             ],
                             token_modifiers: vec![
                                 SemanticTokenModifier::DEFINITION,
@@ -770,36 +772,30 @@ impl LanguageServer for Backend {
             })
         };
         if let Some(ref kw) = value_keyword {
-            if let Some(item_type) = tiger_lib::field_value_item(kw) {
-                // Gather only game_items matching this item_type from the mod index.
-                let mod_root = Self::find_mod_root(&path);
-                let mut filtered: Vec<CompletionItem> = Vec::new();
-                if let Some(ref root) = mod_root {
-                    if let Some(cached) = self.mod_completions.read().await.get(root) {
-                        // mod_completions contains pre-built items — re-filter from raw game_items
-                        // is not available here; fall through to full completions but mark the
-                        // item_type in the detail filter pass below.
-                        let _ = cached; // intentionally unused — we re-scan below
-                    }
-                }
-                // Re-scan for game_items filtered by item_type (fast, cached scan).
-                if let Some(root) = mod_root {
-                    let cfg = self.build_validate_config().await;
-                    let game_dir = cfg.as_ref().map(|c| c.game_dir.clone());
-                    let workshop_dir = cfg.as_ref().and_then(|c| c.workshop_dir.clone());
-                    let item_type_owned = item_type.to_owned();
-                    if let Ok(scan) = tokio::task::spawn_blocking(move || {
-                        scan_mod_items(&root, game_dir.as_deref(), workshop_dir.as_deref())
-                    })
-                    .await
-                    {
-                        for (name, subdir) in scan.game_items {
-                            // Match: item_type "building" matches subdir "buildings" or "building"
-                            if subdir == item_type_owned
-                                || subdir == format!("{item_type_owned}s")
-                                || subdir.starts_with(&item_type_owned)
-                            {
-                                filtered.push(CompletionItem {
+            // field_item_path returns e.g. "common/buildings/" from Item::path().
+            // Extract the final path component ("buildings") to match game_items subdirs.
+            if let Some(item_path) = tiger_lib::field_item_path(kw) {
+                let subdir_expected = item_path
+                    .trim_end_matches('/')
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or(item_path);
+                if !subdir_expected.is_empty() {
+                    let mod_root = Self::find_mod_root(&path);
+                    if let Some(root) = mod_root {
+                        let cfg = self.build_validate_config().await;
+                        let game_dir = cfg.as_ref().map(|c| c.game_dir.clone());
+                        let workshop_dir = cfg.as_ref().and_then(|c| c.workshop_dir.clone());
+                        let expected = subdir_expected.to_owned();
+                        if let Ok(scan) = tokio::task::spawn_blocking(move || {
+                            scan_mod_items(&root, game_dir.as_deref(), workshop_dir.as_deref())
+                        })
+                        .await
+                        {
+                            let filtered: Vec<CompletionItem> = scan.game_items
+                                .into_iter()
+                                .filter(|(_, subdir)| *subdir == expected)
+                                .map(|(name, subdir)| CompletionItem {
                                     label: name.clone(),
                                     kind: Some(CompletionItemKind::ENUM_MEMBER),
                                     detail: Some(subdir.clone()),
@@ -810,16 +806,16 @@ impl LanguageServer for Backend {
                                     insert_text: Some(name),
                                     insert_text_format: Some(InsertTextFormat::PLAIN_TEXT),
                                     ..Default::default()
-                                });
+                                })
+                                .collect();
+                            if !filtered.is_empty() {
+                                return Ok(Some(CompletionResponse::List(CompletionList {
+                                    is_incomplete: false,
+                                    items: filtered,
+                                })));
                             }
                         }
                     }
-                }
-                if !filtered.is_empty() {
-                    return Ok(Some(CompletionResponse::List(CompletionList {
-                        is_incomplete: false,
-                        items: filtered,
-                    })));
                 }
             }
         }
@@ -1230,7 +1226,8 @@ fn selection_range_at(lines: &[&str], pos: &Position) -> SelectionRange {
 }
 
 /// Build semantic token data for the full document.
-/// Token types: 0=keyword, 1=function, 2=variable, 3=string, 4=comment, 5=number
+/// Token types: 0=keyword, 1=function, 2=variable, 3=string, 4=comment, 5=number,
+///              6=namespace (prefix in prefix:value), 7=enum_member (value in prefix:value)
 /// Token modifiers: 0x1=definition
 fn build_semantic_tokens(
     text: &str,
@@ -1329,15 +1326,56 @@ fn build_semantic_tokens(
                 continue;
             }
 
-            // Identifier.
+            // Identifier (possibly prefix:value or scope.chain or @variable).
             if ch.is_alphanumeric() || ch == '_' || ch == '@' {
                 let id_start = byte_i;
                 let mut np = char_pos + 1;
+                // Consume alphanumeric, underscore, dot, colon — we classify after.
                 while np < chars.len() && (chars[np].1.is_alphanumeric() || chars[np].1 == '_' || chars[np].1 == '.' || chars[np].1 == ':') {
                     np += 1;
                 }
                 let id_end = chars.get(np).map(|(bi, _)| *bi).unwrap_or(line.len());
                 let word = &line[id_start..id_end];
+
+                // `prefix:value` pattern — emit namespace token for prefix, enum_member for value.
+                if let Some(colon_pos) = word.find(':') {
+                    // Only treat as tagged if prefix is a plain identifier (no dots/colons before colon).
+                    let prefix = &word[..colon_pos];
+                    let value = &word[colon_pos + 1..];
+                    if !prefix.is_empty()
+                        && !value.is_empty()
+                        && prefix.chars().all(|c| c.is_alphanumeric() || c == '_')
+                    {
+                        let prefix_start = id_start as u32;
+                        let prefix_len = prefix.len() as u32;
+                        let value_start = (id_start + colon_pos + 1) as u32;
+                        let value_len = value.len() as u32;
+
+                        // Prefix token (namespace).
+                        tokens.push(SemanticToken {
+                            delta_line: li - prev_line,
+                            delta_start: if li == prev_line { prefix_start - prev_start } else { prefix_start },
+                            length: prefix_len,
+                            token_type: 6, // namespace
+                            token_modifiers_bitset: 0,
+                        });
+                        prev_line = li;
+                        prev_start = prefix_start;
+
+                        // Value token (enum_member).
+                        tokens.push(SemanticToken {
+                            delta_line: 0,
+                            delta_start: value_start - prev_start, // same line, skip the colon
+                            length: value_len,
+                            token_type: 7, // enum_member
+                            token_modifiers_bitset: 0,
+                        });
+                        prev_start = value_start;
+
+                        char_pos = np;
+                        continue;
+                    }
+                }
 
                 let (tok_type, modifier) = if word.starts_with('@') {
                     (2u32, 0u32) // variable
