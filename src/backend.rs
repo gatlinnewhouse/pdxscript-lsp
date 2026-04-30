@@ -11,7 +11,8 @@ use tower_lsp::lsp_types::*;
 use tower_lsp::{Client, LanguageServer};
 
 use crate::completions::{
-    builtin_completions, scan_mod_items, static_keywords, variable_completions,
+    builtin_completions, detail_hint_from_path, document_top_level_completions,
+    scan_mod_items, static_keywords, variable_completions,
 };
 use crate::demorgan::{find_violations, violation_to_action, violations_to_diagnostics};
 use crate::fold::folding_ranges;
@@ -835,9 +836,12 @@ impl LanguageServer for Backend {
         let mut items = static_keywords();
         items.extend_from_slice(builtin_completions());
 
+        // Live symbols from the current (possibly unsaved) document.
+        let hint = detail_hint_from_path(&path);
         let docs = self.documents.read().await;
         if let Some(text) = docs.get(uri) {
             items.extend(variable_completions(text));
+            items.extend(document_top_level_completions(text, hint));
         }
         drop(docs);
 

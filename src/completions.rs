@@ -126,6 +126,77 @@ pub fn scope_chain_completions() -> Vec<CompletionItem> {
     }).clone()
 }
 
+// ─── Tier 2a: Top-level symbols from current document (live, unsaved) ────────
+
+/// Extract completion items for every top-level `key = {` block in `text`.
+/// Used to surface symbols defined in the currently-open file before they are
+/// saved and picked up by the mod filesystem scan.
+///
+/// The `detail_hint` comes from the file path (e.g. "scripted_effects" → "scripted_effect").
+pub fn document_top_level_completions(text: &str, detail_hint: &str) -> Vec<CompletionItem> {
+    use crate::symbols::top_level_key;
+    let mut items = Vec::new();
+    for line in text.lines() {
+        if let Some(key) = top_level_key(line) {
+            let kind = match detail_hint {
+                "scripted_effects"   | "scripted_effect"   => CompletionItemKind::FUNCTION,
+                "scripted_triggers"  | "scripted_trigger"  => CompletionItemKind::OPERATOR,
+                "scripted_modifiers" | "scripted_modifier" => CompletionItemKind::PROPERTY,
+                "events"             | "event"             => CompletionItemKind::MODULE,
+                _                                          => CompletionItemKind::FUNCTION,
+            };
+            let detail = match detail_hint {
+                "scripted_effects"  | "scripted_effect"   => "scripted_effect",
+                "scripted_triggers" | "scripted_trigger"  => "scripted_trigger",
+                "scripted_modifiers"| "scripted_modifier" => "scripted_modifier",
+                "events"            | "event"             => "event",
+                _                                         => detail_hint,
+            };
+            let insert = if detail == "event" {
+                key.to_owned()
+            } else {
+                format!("{key} = ")
+            };
+            items.push(CompletionItem {
+                label: key.to_owned(),
+                kind: Some(kind),
+                detail: Some(detail.to_owned()),
+                label_details: Some(CompletionItemLabelDetails {
+                    detail: Some(format!(" {detail}")),
+                    description: None,
+                }),
+                insert_text: Some(insert),
+                insert_text_format: Some(InsertTextFormat::PLAIN_TEXT),
+                ..Default::default()
+            });
+        }
+    }
+    items
+}
+
+/// Infer a detail hint ("scripted_effects", "scripted_triggers", etc.) from a file path.
+/// Used to give `document_top_level_completions` the right item type.
+pub fn detail_hint_from_path(path: &std::path::Path) -> &'static str {
+    let components: Vec<&str> = path.components()
+        .filter_map(|c| c.as_os_str().to_str())
+        .collect();
+    for (i, &seg) in components.iter().enumerate() {
+        if seg == "common" {
+            if let Some(&sub) = components.get(i + 1) {
+                return match sub {
+                    "scripted_effects"   => "scripted_effects",
+                    "scripted_triggers"  => "scripted_triggers",
+                    "scripted_modifiers" => "scripted_modifiers",
+                    "decisions"          => "decision",
+                    _                    => "block",
+                };
+            }
+        }
+        if seg == "events" { return "event"; }
+    }
+    "block"
+}
+
 // ─── Tier 2: @variable names from document text ───────────────────────────────
 
 /// Extract every `@name` defined in `text` (lines of the form `@name = value`).
