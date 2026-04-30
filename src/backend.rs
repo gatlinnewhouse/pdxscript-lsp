@@ -891,6 +891,36 @@ impl LanguageServer for Backend {
             }
         }
 
+        // Block-field value completions: cursor is at `field = <cursor>` inside a fixed-schema block.
+        // Look up the enclosing block trigger, find the field in its schema, parse the type hint.
+        if let Some(ref kw) = value_keyword {
+            let field_hint: Option<String> = {
+                let docs = self.documents.read().await;
+                if let Some(text) = docs.get(uri) {
+                    let lines: Vec<&str> = text.lines().collect();
+                    let cursor_line = pos.line as usize;
+                    let cursor_col  = pos.character as usize;
+                    find_enclosing_block_trigger(&lines, cursor_line, cursor_col)
+                        .and_then(|block_name| tiger_lib::block_schema(&block_name))
+                        .and_then(|fields| {
+                            fields.into_iter().find(|f| f.name == kw.as_str()).map(|f| f.type_hint)
+                        })
+                } else {
+                    None
+                }
+            };
+            if let Some(hint) = field_hint {
+                if let Some(items) = completions_from_field_hint(&hint) {
+                    if !items.is_empty() {
+                        return Ok(Some(CompletionResponse::List(CompletionList {
+                            is_incomplete: false,
+                            items,
+                        })));
+                    }
+                }
+            }
+        }
+
         // Flag completions: HOI4 triggers that take a flag name (Trigger::Flag / FlagOrBlock).
         if let Some(ref kw) = value_keyword {
             if tiger_lib::field_is_flag(kw) {
@@ -1724,6 +1754,31 @@ fn value_context_keyword(line: &str, col: usize) -> Option<String> {
     } else {
         None
     }
+}
+
+/// Parse a `SchemaField.type_hint` string and return ENUM_MEMBER completions where possible.
+/// Handles:
+///   "choice:a|b|c"        → ["a", "b", "c"]
+///   "yes/no"              → ["yes", "no"]
+///   "flag|block"          → ["yes"] (the block form; flag names come from mod_flags)
+///   anything else         → None (fall through to generic completions)
+fn completions_from_field_hint(hint: &str) -> Option<Vec<CompletionItem>> {
+    let enum_item = |s: &str| CompletionItem {
+        label: s.to_owned(),
+        kind: Some(CompletionItemKind::ENUM_MEMBER),
+        insert_text: Some(s.to_owned()),
+        insert_text_format: Some(InsertTextFormat::PLAIN_TEXT),
+        ..Default::default()
+    };
+    if hint == "yes/no" {
+        return Some(vec![enum_item("yes"), enum_item("no")]);
+    }
+    if let Some(choices_str) = hint.strip_prefix("choice:") {
+        // Not truncated (truncated form is "choice(..)" which won't have ':').
+        let items: Vec<CompletionItem> = choices_str.split('|').map(enum_item).collect();
+        return Some(items);
+    }
+    None
 }
 
 /// Convert `LspEntry` list to `CompletionItem`s. `context` is used to build the detail string.
