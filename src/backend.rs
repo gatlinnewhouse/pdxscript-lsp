@@ -852,6 +852,43 @@ impl LanguageServer for Backend {
             }
         }
 
+        // Block-field completions: when cursor is inside `trigger_name = { <cursor> }`,
+        // offer the expected field names from tiger's block schema.
+        if value_keyword.is_none() {
+            let block_fields: Option<Vec<tiger_lib::SchemaField>> = {
+                let docs = self.documents.read().await;
+                if let Some(text) = docs.get(uri) {
+                    let lines: Vec<&str> = text.lines().collect();
+                    let cursor_line = pos.line as usize;
+                    let cursor_col  = pos.character as usize;
+                    find_enclosing_block_trigger(&lines, cursor_line, cursor_col)
+                        .and_then(|name| tiger_lib::block_schema(&name))
+                } else {
+                    None
+                }
+            };
+            if let Some(fields) = block_fields {
+                if !fields.is_empty() {
+                    let field_items: Vec<CompletionItem> = fields.iter().map(|f| CompletionItem {
+                        label: f.name.clone(),
+                        kind: Some(CompletionItemKind::FIELD),
+                        detail: Some(f.type_hint.clone()),
+                        label_details: Some(CompletionItemLabelDetails {
+                            detail: Some(format!(" {}", f.type_hint)),
+                            description: None,
+                        }),
+                        insert_text: Some(f.name.clone()),
+                        insert_text_format: Some(InsertTextFormat::PLAIN_TEXT),
+                        ..Default::default()
+                    }).collect();
+                    return Ok(Some(CompletionResponse::List(CompletionList {
+                        is_incomplete: false,
+                        items: field_items,
+                    })));
+                }
+            }
+        }
+
         let mut items = static_keywords();
         items.extend_from_slice(builtin_completions());
 
