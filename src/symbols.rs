@@ -6,8 +6,46 @@ use tower_lsp::lsp_types::{
     DocumentSymbol, Location, Position, Range, SymbolInformation, SymbolKind, Url,
 };
 
+/// Map a scan-time detail string (from `scan_mod_items`) to a SymbolKind.
+pub fn kind_from_detail(detail: &str) -> SymbolKind {
+    match detail {
+        "scripted_effect"   => SymbolKind::FUNCTION,
+        "scripted_trigger"  => SymbolKind::OPERATOR,
+        "scripted_modifier" => SymbolKind::PROPERTY,
+        "event"             => SymbolKind::EVENT,
+        _                   => SymbolKind::OBJECT,
+    }
+}
+
+/// Infer a SymbolKind from a file's `common/` subdirectory name or `events/` path.
+/// Used to give document symbols richer icons than the generic FUNCTION fallback.
+pub fn kind_from_path(path: &std::path::Path) -> SymbolKind {
+    let components: Vec<_> = path.components()
+        .filter_map(|c| c.as_os_str().to_str())
+        .collect();
+
+    // Walk backwards: first `events` dir → EVENT; then check the parent of the filename.
+    for (i, &seg) in components.iter().enumerate() {
+        if seg == "events" { return SymbolKind::EVENT; }
+        if seg == "common" {
+            // Next component is the subdir name.
+            if let Some(&sub) = components.get(i + 1) {
+                return match sub {
+                    "scripted_effects"   => SymbolKind::FUNCTION,
+                    "scripted_triggers"  => SymbolKind::OPERATOR,
+                    "scripted_modifiers" => SymbolKind::PROPERTY,
+                    "decisions"          => SymbolKind::ENUM_MEMBER,
+                    "on_actions"         => SymbolKind::EVENT,
+                    _                    => SymbolKind::MODULE,
+                };
+            }
+        }
+    }
+    SymbolKind::OBJECT
+}
+
 /// Extract top-level `key = { ... }` blocks as document symbols.
-pub fn document_symbols(text: &str) -> Vec<DocumentSymbol> {
+pub fn document_symbols(text: &str, file_kind: SymbolKind) -> Vec<DocumentSymbol> {
     let lines: Vec<&str> = text.lines().collect();
     let mut symbols: Vec<DocumentSymbol> = Vec::new();
     let mut depth: i32 = 0;
@@ -34,9 +72,15 @@ pub fn document_symbols(text: &str) -> Vec<DocumentSymbol> {
                     if depth == 0 {
                         if let Some((name, start)) = pending.take() {
                             let end_char = line.len() as u32;
+                            // Events override the file-level kind.
+                            let kind = if name.contains('.') {
+                                SymbolKind::EVENT
+                            } else {
+                                file_kind
+                            };
                             symbols.push(DocumentSymbol {
                                 name: name.clone(),
-                                kind: symbol_kind_for(&name),
+                                kind,
                                 range: Range {
                                     start: Position { line: start, character: 0 },
                                     end: Position { line: lnum, character: end_char },
@@ -48,7 +92,7 @@ pub fn document_symbols(text: &str) -> Vec<DocumentSymbol> {
                                         character: lines[start as usize].len() as u32,
                                     },
                                 },
-                                detail: None,
+                                detail: Some(kind_detail(kind)),
                                 tags: None,
                                 deprecated: None,
                                 children: None,
@@ -73,11 +117,11 @@ pub fn workspace_symbols(
     definitions
         .iter()
         .filter(|(name, _)| name.to_lowercase().contains(&q))
-        .map(|(name, (loc, _detail))| {
+        .map(|(name, (loc, detail))| {
             #[allow(deprecated)]
             SymbolInformation {
                 name: name.clone(),
-                kind: symbol_kind_for(name),
+                kind: kind_from_detail(detail),
                 location: loc.clone(),
                 container_name: None,
                 tags: None,
@@ -87,12 +131,15 @@ pub fn workspace_symbols(
         .collect()
 }
 
-fn symbol_kind_for(name: &str) -> SymbolKind {
-    // Events have a dot in their id (namespace.id)
-    if name.contains('.') {
-        SymbolKind::EVENT
-    } else {
-        SymbolKind::FUNCTION
+fn kind_detail(kind: SymbolKind) -> String {
+    match kind {
+        SymbolKind::FUNCTION    => "scripted_effect".to_owned(),
+        SymbolKind::OPERATOR    => "scripted_trigger".to_owned(),
+        SymbolKind::PROPERTY    => "scripted_modifier".to_owned(),
+        SymbolKind::EVENT       => "event".to_owned(),
+        SymbolKind::ENUM_MEMBER => "decision".to_owned(),
+        SymbolKind::MODULE      => "block".to_owned(),
+        _                       => "item".to_owned(),
     }
 }
 

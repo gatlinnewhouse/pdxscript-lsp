@@ -22,7 +22,7 @@ use crate::gamedir::{
 use crate::hover::{hover_builtin, hover_diagnostic_code, hover_scripted, hover_variable};
 use crate::references::{find_references, rename_edit};
 use crate::symbols::{
-    defs_to_locations, document_symbols, word_at, workspace_symbols,
+    defs_to_locations, document_symbols, kind_from_path, word_at, workspace_symbols,
 };
 use crate::validate::{DiagMap, HintMap, ValidateConfig, validate_mod};
 
@@ -668,7 +668,10 @@ impl LanguageServer for Backend {
         let docs = self.documents.read().await;
         let text = match docs.get(uri) { Some(t) => t.clone(), None => return Ok(None) };
         drop(docs);
-        let syms = document_symbols(&text);
+        let file_kind = uri.to_file_path()
+            .map(|p| kind_from_path(&p))
+            .unwrap_or(tower_lsp::lsp_types::SymbolKind::OBJECT);
+        let syms = document_symbols(&text, file_kind);
         if syms.is_empty() {
             Ok(None)
         } else {
