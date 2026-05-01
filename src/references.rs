@@ -73,3 +73,87 @@ pub fn rename_edit(refs: &[Location], new_name: &str) -> WorkspaceEdit {
     }
     WorkspaceEdit { changes: Some(changes), ..Default::default() }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tower_lsp::lsp_types::Url;
+
+    fn fake_uri() -> Url {
+        Url::parse("file:///tmp/test.txt").unwrap()
+    }
+
+    fn occurrences(name: &str, text: &str) -> Vec<Location> {
+        let uri = fake_uri();
+        let mut out = Vec::new();
+        collect_occurrences(name, text, uri, &mut out);
+        out
+    }
+
+    #[test]
+    fn finds_simple_occurrence() {
+        let locs = occurrences("my_effect", "my_effect = yes\n");
+        assert_eq!(locs.len(), 1);
+        assert_eq!(locs[0].range.start.character, 0);
+    }
+
+    #[test]
+    fn finds_multiple_occurrences_same_line() {
+        let locs = occurrences("foo", "foo = foo\n");
+        assert_eq!(locs.len(), 2);
+    }
+
+    #[test]
+    fn skips_comment_text() {
+        let locs = occurrences("foo", "bar = yes # foo here\n");
+        assert_eq!(locs.len(), 0, "should not find foo in a comment");
+    }
+
+    #[test]
+    fn does_not_match_substring() {
+        // "foo" should not match inside "foobar" or "myfoo"
+        let locs = occurrences("foo", "foobar = yes\nmyfoo = yes\n");
+        assert_eq!(locs.len(), 0);
+    }
+
+    #[test]
+    fn matches_whole_word_boundary() {
+        let locs = occurrences("foo", "a = foo\n");
+        assert_eq!(locs.len(), 1);
+        assert_eq!(locs[0].range.start.character, 4);
+    }
+
+    #[test]
+    fn rename_edit_produces_text_edits() {
+        let uri = fake_uri();
+        let loc = Location {
+            uri: uri.clone(),
+            range: Range {
+                start: Position { line: 0, character: 0 },
+                end: Position { line: 0, character: 9 },
+            },
+        };
+        let edit = rename_edit(&[loc], "new_name");
+        let changes = edit.changes.unwrap();
+        let edits = changes.get(&uri).unwrap();
+        assert_eq!(edits.len(), 1);
+        assert_eq!(edits[0].new_text, "new_name");
+    }
+
+    #[test]
+    fn rename_edit_groups_by_file() {
+        let uri1 = Url::parse("file:///tmp/a.txt").unwrap();
+        let uri2 = Url::parse("file:///tmp/b.txt").unwrap();
+        let make_loc = |uri: Url| Location {
+            uri,
+            range: Range {
+                start: Position { line: 0, character: 0 },
+                end: Position { line: 0, character: 3 },
+            },
+        };
+        let edit = rename_edit(&[make_loc(uri1.clone()), make_loc(uri2.clone()), make_loc(uri1.clone())], "x");
+        let changes = edit.changes.unwrap();
+        assert_eq!(changes[&uri1].len(), 2);
+        assert_eq!(changes[&uri2].len(), 1);
+    }
+}

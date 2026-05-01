@@ -245,6 +245,8 @@ pub struct ModItems {
     pub definitions: std::collections::HashMap<String, (std::path::PathBuf, u32, String)>,
     /// HOI4 flag names collected from set_*_flag effects across all script files.
     pub flags: Vec<String>,
+    /// Script variable names (set_variable/set_global_variable etc.) across all script files.
+    pub script_variables: Vec<String>,
 }
 
 impl ModItems {
@@ -282,6 +284,20 @@ impl ModItems {
                     detail: Some(" @var".to_owned()),
                     description: None,
                 }),
+                insert_text_format: Some(InsertTextFormat::PLAIN_TEXT),
+                ..Default::default()
+            });
+        }
+        for name in self.script_variables {
+            out.push(CompletionItem {
+                label: name.clone(),
+                kind: Some(CompletionItemKind::VARIABLE),
+                detail: Some("script variable".to_owned()),
+                label_details: Some(CompletionItemLabelDetails {
+                    detail: Some(" variable".to_owned()),
+                    description: None,
+                }),
+                insert_text: Some(name),
                 insert_text_format: Some(InsertTextFormat::PLAIN_TEXT),
                 ..Default::default()
             });
@@ -406,6 +422,7 @@ fn scan_single_mod(root: &Path) -> ModItems {
         game_items,
         definitions,
         flags,
+        script_variables: scan_script_variables_in_tree(root),
     }
 }
 
@@ -445,6 +462,7 @@ fn merge_items(dst: &mut ModItems, src: ModItems) {
     dst.icons.extend(src.icons);
     dst.game_items.extend(src.game_items);
     dst.flags.extend(src.flags);
+    dst.script_variables.extend(src.script_variables);
     for (k, v) in src.definitions {
         // Mod definitions take precedence over dependency/game definitions.
         dst.definitions.entry(k).or_insert(v);
@@ -460,6 +478,7 @@ fn dedup_items(items: &mut ModItems) {
         &mut items.at_variables,
         &mut items.icons,
         &mut items.flags,
+        &mut items.script_variables,
     ] {
         v.sort_unstable();
         v.dedup();
@@ -649,6 +668,161 @@ fn parse_flag_set(line: &str) -> Option<&str> {
     Some(flag)
 }
 
+// ─── Script variable name scanning ───────────────────────────────────────────
+
+/// Effects that introduce a named script variable and the field holding the name.
+/// Covers Jomini games (CK3, VIC3, EU5, Imperator) and HOI4.
+const VAR_SETTERS: &[(&str, &str)] = &[
+    ("set_variable",                  "name"),
+    ("set_global_variable",           "name"),
+    ("set_local_variable",            "name"),
+    ("set_dead_character_variable",   "name"),
+    ("add_to_variable_list",          "name"),
+    ("add_to_global_variable_list",   "name"),
+    ("add_to_local_variable_list",    "name"),
+    // HOI4 uses "var" instead of "name"
+    ("set_temp_variable",             "var"),
+    ("set_variable_to_random",        "var"),
+    ("set_temp_variable_to_random",   "var"),
+    ("add_to_array",                  "array"),
+    ("add_to_temp_array",             "array"),
+];
+
+/// Walk common/, events/, and history/ collecting script variable names.
+fn scan_script_variables_in_tree(root: &Path) -> Vec<String> {
+    let mut names = Vec::new();
+    for subdir in &["common", "events", "history", "national_focus", "decisions"] {
+        scan_script_variables_in_dir(&root.join(subdir), &mut names);
+    }
+    names.sort_unstable();
+    names.dedup();
+    names
+}
+
+fn scan_script_variables_in_dir(dir: &Path, out: &mut Vec<String>) {
+    let Ok(entries) = fs::read_dir(dir) else { return };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            scan_script_variables_in_dir(&path, out);
+        } else if path.extension().and_then(|e| e.to_str()) == Some("txt") {
+            let Ok(text) = fs::read_to_string(&path) else { continue };
+            scan_script_variables_in_text(&text, out);
+        }
+    }
+}
+
+/// Parse script variable names from a block of PDX script text.
+///
+/// Handles two forms:
+/// - Block: `set_variable = { name = my_var ... }` (possibly multi-line)
+/// - Assign: `set_variable = my_var` (simple scalar form, Jomini)
+pub(crate) fn scan_script_variables_in_text(text: &str, out: &mut Vec<String>) {
+    // Which field name to look for inside the currently-open variable block.
+    let mut in_var_block: Option<&'static str> = None;
+
+    for line in text.lines() {
+        let t = line.trim();
+        // Strip inline comment.
+        let t = t.split('#').next().unwrap_or("").trim();
+        if t.is_empty() { continue; }
+
+        if let Some(field) = in_var_block {
+            // Inside a variable block: look for `field = VARNAME` or closing `}`.
+            if t.contains('}') {
+                in_var_block = None;
+            }
+            // Check all known name fields (not just the expected one, for robustness).
+            for kw in &["name", "var", "which", "array"] {
+                if let Some(rest) = t.strip_prefix(kw) {
+                    let rest = rest.trim_start();
+                    if let Some(rhs) = rest.strip_prefix('=') {
+                        let name = rhs.trim().split_whitespace().next().unwrap_or("");
+                        if is_valid_var_name(name) {
+                            out.push(name.to_owned());
+                        }
+                        break;
+                    }
+                }
+            }
+            let _ = field;
+            continue;
+        }
+
+        // Not in a block — look for a setter keyword.
+        let eq_pos = match t.find('=') {
+            Some(p) => p,
+            None => continue,
+        };
+        let kw = t[..eq_pos].trim();
+        let rhs = t[eq_pos + 1..].trim();
+
+        let field = VAR_SETTERS.iter()
+            .find(|(setter, _)| kw.eq_ignore_ascii_case(setter))
+            .map(|(_, f)| *f);
+
+        let Some(field) = field else { continue };
+
+        if rhs.starts_with('{') {
+            if rhs.contains('}') {
+                // Single-line block: `set_variable = { name = foo value = 1 }`
+                // Scan the inline content for the name field.
+                let inner = &rhs[1..rhs.rfind('}').unwrap_or(rhs.len())];
+                for kw2 in &["name", "var", "which", "array"] {
+                    if let Some(rest) = find_field(inner, kw2) {
+                        if is_valid_var_name(rest) {
+                            out.push(rest.to_owned());
+                        }
+                        break;
+                    }
+                }
+            } else {
+                // Multi-line block opens here.
+                in_var_block = Some(field);
+                // Also check if name is on the same line as the opener.
+                let inner = &rhs[1..];
+                for kw2 in &["name", "var", "which", "array"] {
+                    if let Some(rest) = find_field(inner, kw2) {
+                        if is_valid_var_name(rest) {
+                            out.push(rest.to_owned());
+                        }
+                        break;
+                    }
+                }
+            }
+        } else if !rhs.is_empty() {
+            // Simple scalar: `set_variable = my_var`
+            let name = rhs.split_whitespace().next().unwrap_or("");
+            if is_valid_var_name(name) {
+                out.push(name.to_owned());
+            }
+        }
+    }
+}
+
+/// Extract the value of `key = VALUE` from a fragment of text.
+fn find_field<'a>(text: &'a str, key: &str) -> Option<&'a str> {
+    let mut rest = text;
+    loop {
+        let pos = rest.find(key)?;
+        let after = rest[pos + key.len()..].trim_start();
+        if let Some(val_rest) = after.strip_prefix('=') {
+            let val = val_rest.trim().split_whitespace().next().unwrap_or("");
+            return if val.is_empty() { None } else { Some(val) };
+        }
+        rest = &rest[pos + 1..];
+    }
+}
+
+fn is_valid_var_name(s: &str) -> bool {
+    !s.is_empty()
+        && !s.starts_with('{')
+        && !s.starts_with('@')
+        && !s.starts_with('"')
+        && s != "0"
+        && s.chars().next().map_or(false, |c| c.is_ascii_alphabetic() || c == '_')
+}
+
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
 /// Collect `identifier = {` keys with their definition location (path, 1-based line).
@@ -802,3 +976,136 @@ fn parse_gfx_name(line: &str) -> Option<&str> {
     if name.is_empty() { None } else { Some(name) }
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── parse_variable_def ────────────────────────────────────────────────────
+
+    #[test]
+    fn variable_def_simple() {
+        assert_eq!(parse_variable_def("@my_cost = 5"), Some("my_cost"));
+    }
+
+    #[test]
+    fn variable_def_with_spaces() {
+        assert_eq!(parse_variable_def("  @foo = 10"), Some("foo"));
+    }
+
+    #[test]
+    fn variable_def_expr_rhs() {
+        // LHS is a normal name; RHS is a computed @[...] expression.
+        assert_eq!(
+            parse_variable_def("@canton_scale_cross_x = @[ ( 333 / coa_width ) + 0.001 ]"),
+            Some("canton_scale_cross_x"),
+        );
+    }
+
+    #[test]
+    fn variable_def_short_expr_rhs() {
+        assert_eq!(parse_variable_def("@third = @[1/3]"), Some("third"));
+    }
+
+    #[test]
+    fn variable_def_bracket_form_skipped() {
+        // Bare @[expr] on a line — not a definition.
+        assert_eq!(parse_variable_def("@[foo]"), None);
+    }
+
+    #[test]
+    fn variable_def_non_at_line_is_none() {
+        assert_eq!(parse_variable_def("foo = bar"), None);
+    }
+
+    // ── parse_flag_set ────────────────────────────────────────────────────────
+
+    #[test]
+    fn flag_set_country_flag() {
+        assert_eq!(parse_flag_set("set_country_flag = my_flag"), Some("my_flag"));
+    }
+
+    #[test]
+    fn flag_set_global_flag() {
+        assert_eq!(parse_flag_set("  set_global_flag = gflag"), Some("gflag"));
+    }
+
+    #[test]
+    fn flag_set_block_form_ignored() {
+        assert_eq!(parse_flag_set("set_country_flag = { flag = foo }"), None);
+    }
+
+    #[test]
+    fn flag_non_flag_keyword_is_none() {
+        assert_eq!(parse_flag_set("set_variable = foo"), None);
+    }
+
+    // ── scan_script_variables_in_text ─────────────────────────────────────────
+
+    fn var_scan(s: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        scan_script_variables_in_text(s, &mut out);
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+
+    #[test]
+    fn script_var_block_form_jomini() {
+        let text = "set_variable = {\n  name = my_var\n  value = 1\n}";
+        let vars = var_scan(text);
+        assert!(vars.contains(&"my_var".to_owned()), "got: {vars:?}");
+    }
+
+    #[test]
+    fn script_var_global_block() {
+        let text = "set_global_variable = {\n  name = global_foo\n  value = 2\n}";
+        let vars = var_scan(text);
+        assert!(vars.contains(&"global_foo".to_owned()), "got: {vars:?}");
+    }
+
+    #[test]
+    fn script_var_hoi4_var_field() {
+        let text = "set_temp_variable = {\n  var = temp_val\n  value = 3\n}";
+        let vars = var_scan(text);
+        assert!(vars.contains(&"temp_val".to_owned()), "got: {vars:?}");
+    }
+
+    #[test]
+    fn script_var_inline_block() {
+        let text = "set_variable = { name = inline_var value = 5 }";
+        let vars = var_scan(text);
+        assert!(vars.contains(&"inline_var".to_owned()), "got: {vars:?}");
+    }
+
+    #[test]
+    fn script_var_numeric_value_not_collected() {
+        let text = "set_variable = 0\n";
+        let vars = var_scan(text);
+        assert!(!vars.contains(&"0".to_owned()), "got: {vars:?}");
+    }
+
+    #[test]
+    fn script_var_at_expression_not_collected() {
+        let text = "set_variable = {\n  name = @my_val\n  value = 1\n}";
+        let vars = var_scan(text);
+        assert!(!vars.iter().any(|v| v.starts_with('@')), "got: {vars:?}");
+    }
+
+    // ── variable_completions ──────────────────────────────────────────────────
+
+    #[test]
+    fn variable_completions_returns_items() {
+        let text = "@cost = 5\n@strength = 10\n";
+        let items = variable_completions(text);
+        assert_eq!(items.len(), 2);
+        assert!(items.iter().any(|i| i.label == "@cost"));
+        assert!(items.iter().any(|i| i.label == "@strength"));
+    }
+
+    #[test]
+    fn variable_completions_empty_for_no_vars() {
+        let text = "foo = bar\n# just a comment\n";
+        assert!(variable_completions(text).is_empty());
+    }
+}

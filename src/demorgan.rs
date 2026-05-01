@@ -57,7 +57,8 @@ pub fn find_violations(lines: &[&str]) -> Vec<Violation> {
             };
 
         // Find the inner AND/OR = { immediately inside (only whitespace allowed between)
-        let (inner_op, inner_line_idx, inner_brace_col) =
+        // Returns (op, line, op_start_col, brace_col).
+        let (inner_op, inner_line_idx, inner_op_col, inner_brace_col) =
             match find_inner_op(lines, i, not_brace_col, not_close_line, not_close_col) {
                 Some(v) => v,
                 None => continue,
@@ -77,7 +78,7 @@ pub fn find_violations(lines: &[&str]) -> Vec<Violation> {
             not_close_line,
             not_close_col,
             inner_line_idx,
-            inner_brace_col,
+            inner_op_col,    // use op keyword start, not brace col
             inner_close_line,
             inner_close_col,
         ) {
@@ -176,13 +177,14 @@ fn find_close(lines: &[&str], start_line: usize, start_col: usize) -> Option<(us
 
 /// Look for `AND = {` or `OR = {` immediately after the NOT's `{`.
 /// Only whitespace/comments are allowed between the NOT `{` and the inner op.
+/// Returns `(op, line, op_keyword_col, brace_col)`.
 fn find_inner_op(
     lines: &[&str],
     not_line: usize,
     not_brace_col: usize,
     not_close_line: usize,
     not_close_col: usize,
-) -> Option<(String, usize, usize)> {
+) -> Option<(String, usize, usize, usize)> {
     // Check same line after not_brace_col first, then subsequent lines.
     let search_lines: Vec<(usize, &str, usize)> = {
         let mut v = Vec::new();
@@ -209,12 +211,14 @@ fn find_inner_op(
                 if after_op.starts_with('=') {
                     let after_eq = after_op[1..].trim_start();
                     if after_eq.starts_with('{') {
-                        // Find the `{` col in the original line
-                        let brace_col = col_from + spaces + op.len()
+                        // Column of the op keyword start ("AND"/"OR").
+                        let op_col = col_from + spaces;
+                        // Column of the `{`.
+                        let brace_col = op_col + op.len()
                             + (trimmed[op.len()..].len() - after_op.len())
                             + 1  // the `=`
                             + (after_op[1..].len() - after_eq.len());
-                        return Some((op.to_string(), l, brace_col));
+                        return Some((op.to_string(), l, op_col, brace_col));
                     }
                 }
             }
@@ -400,3 +404,70 @@ fn build_edit(uri: &Url, lines: &[&str], v: &Violation) -> WorkspaceEdit {
 
     WorkspaceEdit { changes: Some(changes), ..Default::default() }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn lines(s: &str) -> Vec<&str> {
+        s.lines().collect()
+    }
+
+    #[test]
+    fn detects_not_or() {
+        let script = "NOT = {\n  OR = {\n    a = yes\n    b = yes\n  }\n}";
+        let vs = find_violations(&lines(script));
+        assert_eq!(vs.len(), 1);
+        assert_eq!(vs[0].inner_op, "OR");
+        assert_eq!(vs[0].not_line, 0);
+    }
+
+    #[test]
+    fn detects_not_and() {
+        let script = "NOT = {\n  AND = {\n    x = yes\n  }\n}";
+        let vs = find_violations(&lines(script));
+        assert_eq!(vs.len(), 1);
+        assert_eq!(vs[0].inner_op, "AND");
+    }
+
+    #[test]
+    fn no_violation_for_plain_not() {
+        let script = "NOT = {\n  a = yes\n  b = no\n}";
+        assert!(find_violations(&lines(script)).is_empty());
+    }
+
+    #[test]
+    fn no_violation_when_not_wraps_non_logic() {
+        // NOT wrapping something that is neither AND nor OR.
+        let script = "NOT = {\n  is_ruler = yes\n}";
+        assert!(find_violations(&lines(script)).is_empty());
+    }
+
+    #[test]
+    fn multiple_violations() {
+        let script = concat!(
+            "NOT = {\n  OR = {\n    a = yes\n  }\n}\n",
+            "NOT = {\n  AND = {\n    b = yes\n  }\n}"
+        );
+        let vs = find_violations(&lines(script));
+        assert_eq!(vs.len(), 2);
+    }
+
+    #[test]
+    fn diagnostic_hint_severity() {
+        let script = "NOT = {\n  OR = {\n    a = yes\n  }\n}";
+        let vs = find_violations(&lines(script));
+        let diags = violations_to_diagnostics(&vs);
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].severity, Some(DiagnosticSeverity::HINT));
+    }
+
+    #[test]
+    fn diagnostic_message_mentions_de_morgan() {
+        let script = "NOT = {\n  OR = {\n    a = yes\n  }\n}";
+        let vs = find_violations(&lines(script));
+        let diags = violations_to_diagnostics(&vs);
+        assert!(diags[0].message.contains("de-morgan") || diags[0].message.contains("OR"));
+    }
+}
+

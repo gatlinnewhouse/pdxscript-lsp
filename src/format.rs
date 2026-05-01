@@ -79,3 +79,66 @@ fn format_lines(lines: &[&str]) -> Vec<String> {
 
     result
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fmt(s: &str) -> String {
+        format_lines(&s.lines().collect::<Vec<_>>()).join("\n")
+    }
+
+    #[test]
+    fn indents_nested_blocks() {
+        let input = "foo = {\nbar = yes\n}";
+        let out = fmt(input);
+        assert_eq!(out, "foo = {\n  bar = yes\n}");
+    }
+
+    #[test]
+    fn already_formatted_unchanged() {
+        let input = "foo = {\n  bar = yes\n}";
+        assert_eq!(fmt(input), input);
+    }
+
+    #[test]
+    fn closing_brace_dedents() {
+        let input = "a = {\n  b = {\n  c = yes\n  }\n}";
+        let out = fmt(input);
+        assert_eq!(out, "a = {\n  b = {\n    c = yes\n  }\n}");
+    }
+
+    #[test]
+    fn empty_lines_preserved() {
+        let input = "a = {\n\nb = yes\n}";
+        let out = fmt(input);
+        assert_eq!(out, "a = {\n\n  b = yes\n}");
+    }
+
+    #[test]
+    fn comments_indented() {
+        let input = "a = {\n# comment\nb = yes\n}";
+        let out = fmt(input);
+        assert_eq!(out, "a = {\n  # comment\n  b = yes\n}");
+    }
+
+    #[test]
+    fn no_change_returns_none() {
+        let text = "a = {\n  b = yes\n}\n";
+        assert!(format_document(text).is_none());
+    }
+
+    #[test]
+    fn trailing_newline_preserved() {
+        let text = "a={\nb=yes\n}\n";
+        let edits = format_document(text).expect("should produce edits");
+        assert!(edits[0].new_text.ends_with('\n'));
+    }
+
+    #[test]
+    fn inline_brace_pair_no_extra_indent() {
+        // `trigger = { always = yes }` stays flat.
+        let input = "t = { always = yes }";
+        assert_eq!(fmt(input), "t = { always = yes }");
+    }
+}

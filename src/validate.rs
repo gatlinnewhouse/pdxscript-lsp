@@ -134,9 +134,17 @@ pub fn validate_mod(mod_root: &Path, cfg: &ValidateConfig) -> Result<(DiagMap, H
             if let Some(wiki) = &meta.wiki {
                 message.push('\n');
                 message.push_str(wiki);
-            } else if let Some(url) = crate::wiki::fallback_wiki_url(&meta.key.to_string()) {
-                message.push('\n');
-                message.push_str(url);
+            } else {
+                // Try path-based resolution first (most specific), then key-based fallback.
+                let path_url = primary.loc.fullpath()
+                    .to_str()
+                    .and_then(|s| crate::wiki::path_wiki_url(s));
+                let url = path_url
+                    .or_else(|| crate::wiki::fallback_wiki_url(&meta.key.to_string()));
+                if let Some(url) = url {
+                    message.push('\n');
+                    message.push_str(url);
+                }
             }
 
             // Attach related locations for secondary pointers.

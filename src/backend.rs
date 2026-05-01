@@ -198,15 +198,25 @@ impl Backend {
         let lines: Vec<&str> = text.lines().collect();
         let violations = find_violations(&lines);
         let mut diags = violations_to_diagnostics(&violations);
-        if let Some(existing) = self.published.lock().await.get(uri) {
-            let tiger: Vec<_> = existing
-                .iter()
-                .filter(|d| {
-                    d.code != Some(NumberOrString::String("de-morgan".to_owned()))
-                })
-                .cloned()
-                .collect();
-            diags.extend(tiger);
+        {
+            let mut published = self.published.lock().await;
+            if let Some(existing) = published.get(uri) {
+                // Keep existing tiger diagnostics; replace old de-morgan entries.
+                let tiger: Vec<_> = existing
+                    .iter()
+                    .filter(|d| {
+                        d.code != Some(NumberOrString::String("de-morgan".to_owned()))
+                    })
+                    .cloned()
+                    .collect();
+                diags.extend(tiger);
+            }
+            // Write back so publish_tiger_diagnostics can see this file on next save.
+            if diags.is_empty() {
+                published.remove(uri);
+            } else {
+                published.insert(uri.clone(), diags.clone());
+            }
         }
         self.client.publish_diagnostics(uri.clone(), diags, None).await;
     }
@@ -810,6 +820,67 @@ impl LanguageServer for Backend {
                 is_incomplete: false,
                 items,
             })));
+        }
+
+        // `@[` context → bare variable name completions (no @ prefix) for math expressions.
+        // Detected by examining the line prefix up to the cursor for `@[`.
+        {
+            let in_at_expr = {
+                let docs = self.documents.read().await;
+                docs.get(uri).and_then(|text| {
+                    let pos = &params.text_document_position.position;
+                    let line = text.lines().nth(pos.line as usize)?;
+                    let up_to_cursor = &line[..pos.character.min(line.len() as u32) as usize];
+                    // Inside @[...] if there's an unmatched @[ before the cursor.
+                    let open = up_to_cursor.rfind("@[")?;
+                    let close = up_to_cursor[open..].find(']');
+                    if close.is_none() { Some(()) } else { None }
+                })
+            };
+            if in_at_expr.is_some() {
+                // Offer bare variable names (strip the @ prefix) for use in math expressions.
+                let mut items = Vec::new();
+                if let Some(mod_root) = Self::find_mod_root(&path) {
+                    if let Some(cached) = self.mod_completions.read().await.get(&mod_root) {
+                        for item in cached.iter() {
+                            if item.detail.as_deref() == Some("@variable") {
+                                // Strip the leading '@' from the label.
+                                let bare = item.label.trim_start_matches('@').to_owned();
+                                items.push(tower_lsp::lsp_types::CompletionItem {
+                                    label: bare.clone(),
+                                    kind: Some(tower_lsp::lsp_types::CompletionItemKind::VARIABLE),
+                                    detail: Some("@variable (expr)".to_owned()),
+                                    insert_text: Some(bare),
+                                    insert_text_format: Some(tower_lsp::lsp_types::InsertTextFormat::PLAIN_TEXT),
+                                    ..Default::default()
+                                });
+                            }
+                        }
+                    }
+                    // Also scan the current document for @var definitions.
+                    let docs = self.documents.read().await;
+                    if let Some(text) = docs.get(uri) {
+                        for item in crate::completions::variable_completions(text) {
+                            let bare = item.label.trim_start_matches('@').to_owned();
+                            items.push(tower_lsp::lsp_types::CompletionItem {
+                                label: bare.clone(),
+                                kind: Some(tower_lsp::lsp_types::CompletionItemKind::VARIABLE),
+                                detail: Some("@variable (expr)".to_owned()),
+                                insert_text: Some(bare),
+                                insert_text_format: Some(tower_lsp::lsp_types::InsertTextFormat::PLAIN_TEXT),
+                                ..Default::default()
+                            });
+                        }
+                    }
+                }
+                // Deduplicate.
+                items.sort_unstable_by(|a, b| a.label.cmp(&b.label));
+                items.dedup_by(|a, b| a.label == b.label);
+                return Ok(Some(CompletionResponse::List(CompletionList {
+                    is_incomplete: false,
+                    items,
+                })));
+            }
         }
 
         // Detect value context: cursor is after `keyword = `.
