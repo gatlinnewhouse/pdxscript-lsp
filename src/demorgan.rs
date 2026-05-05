@@ -476,5 +476,73 @@ mod tests {
         let diags = violations_to_diagnostics(&vs);
         assert!(diags[0].message.contains("de-morgan") || diags[0].message.contains("OR"));
     }
+
+    // ─── Rewrite output tests ─────────────────────────────────────────────────
+
+    fn rewrite_text(script: &str) -> String {
+        let ls = lines(script);
+        let vs = find_violations(&ls);
+        assert!(!vs.is_empty(), "no violations found in: {script}");
+        let uri = Url::parse("file:///test.txt").unwrap();
+        let action = violation_to_action(&uri, &ls, &vs[0]);
+        match action {
+            CodeActionOrCommand::CodeAction(ca) => {
+                let edit = ca.edit.unwrap();
+                let changes = edit.changes.unwrap();
+                let edits = changes.into_values().next().unwrap();
+                edits.into_iter().next().unwrap().new_text
+            }
+            _ => panic!("expected CodeAction"),
+        }
+    }
+
+    #[test]
+    fn rewrite_not_or_produces_and_not() {
+        let script = "NOT = {\n    OR = {\n        a = yes\n        b = yes\n    }\n}";
+        let text = rewrite_text(script);
+        assert!(text.contains("AND = {"), "missing AND: {text}");
+        assert!(!text.contains("OR = {"), "OR not removed: {text}");
+        assert!(!text.contains("NOT = {\n    OR"), "outer NOT not removed: {text}");
+        // Both children wrapped in NOT
+        assert_eq!(text.matches("NOT = {").count(), 2, "expected 2 NOT wrappers: {text}");
+    }
+
+    #[test]
+    fn rewrite_not_and_produces_or_not() {
+        let script = "NOT = {\n    AND = {\n        x = yes\n    }\n}";
+        let text = rewrite_text(script);
+        assert!(text.contains("OR = {"), "missing OR: {text}");
+        assert!(!text.contains("AND = {"), "AND not removed: {text}");
+        assert_eq!(text.matches("NOT = {").count(), 1, "expected 1 NOT wrapper: {text}");
+    }
+
+    #[test]
+    fn rewrite_not_or_two_has_variable() {
+        // Reproduces the real-world crash case: `has_variable = X` children inside OR.
+        let script =
+            "NOT = {\n    OR = {\n        has_variable = ismail_var\n        has_variable = hawduqo_var\n    }\n}";
+        let text = rewrite_text(script);
+        assert!(text.contains("AND = {"), "missing AND: {text}");
+        assert!(text.contains("has_variable = ismail_var"), "first child lost: {text}");
+        assert!(text.contains("has_variable = hawduqo_var"), "second child lost: {text}");
+        assert_eq!(text.matches("NOT = {").count(), 2, "expected 2 NOT wrappers: {text}");
+        assert!(!text.contains("AND = {\n}"), "empty AND block: {text}");
+    }
+
+    #[test]
+    fn rewrite_preserves_indentation() {
+        let script = "    NOT = {\n        OR = {\n            a = yes\n        }\n    }";
+        let text = rewrite_text(script);
+        assert!(text.starts_with("    AND = {"), "wrong indent: {text}");
+    }
+
+    #[test]
+    fn rewrite_multiline_child_wraps_in_block() {
+        // Child spanning multiple lines should produce NOT = { \n ... \n } block form.
+        let script = "NOT = {\n    OR = {\n        trigger_if = {\n            limit = { a = yes }\n        }\n    }\n}";
+        let text = rewrite_text(script);
+        assert!(text.contains("AND = {"), "missing AND: {text}");
+        assert!(text.contains("trigger_if"), "multiline child lost: {text}");
+    }
 }
 

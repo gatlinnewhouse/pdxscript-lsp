@@ -50,14 +50,31 @@ pub fn document_symbols(text: &str, file_kind: SymbolKind) -> Vec<DocumentSymbol
     let mut symbols: Vec<DocumentSymbol> = Vec::new();
     let mut depth: i32 = 0;
     let mut pending: Option<(String, u32)> = None; // (name, start_line)
+    let mut pending_key: Option<(String, u32)> = None; // key seen on prev line, waiting for `{`
 
     for (i, &line) in lines.iter().enumerate() {
         let lnum = i as u32;
 
-        // At depth 0, detect `key = {`
+        // At depth 0, detect `key = {` (same-line) or Allman-style `key =` then `{` next line.
         if depth == 0 {
             if let Some(name) = top_level_key(line) {
+                pending_key = None;
                 pending = Some((name.to_owned(), lnum));
+            } else if let Some((key, key_line)) = pending_key.take() {
+                // Previous line had `key =`; if this line starts with `{`, treat as block start.
+                let t = line.trim_start();
+                if t.starts_with('{') {
+                    pending = Some((key, key_line));
+                }
+            } else {
+                // Check for `key =` without trailing `{` (Allman brace on next line).
+                let t = line.trim_end();
+                if !t.starts_with(|c: char| c.is_whitespace() || c == '#') && t.ends_with('=') {
+                    let ident = t[..t.len()-1].trim_end();
+                    if !ident.is_empty() && ident.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '.') {
+                        pending_key = Some((ident.to_owned(), lnum));
+                    }
+                }
             }
         }
 

@@ -386,7 +386,7 @@ impl LanguageServer for Backend {
                             ],
                         },
                         full: Some(SemanticTokensFullOptions::Bool(true)),
-                        range: Some(false),
+                        range: Some(true),
                         work_done_progress_options: Default::default(),
                     }),
                 ),
@@ -1366,6 +1366,27 @@ impl LanguageServer for Backend {
         Ok(Some(SemanticTokensResult::Tokens(SemanticTokens { result_id: None, data })))
     }
 
+    async fn semantic_tokens_range(
+        &self,
+        params: SemanticTokensRangeParams,
+    ) -> LspResult<Option<SemanticTokensRangeResult>> {
+        let uri = &params.text_document.uri;
+        let docs = self.documents.read().await;
+        let text = match docs.get(uri) { Some(t) => t.clone(), None => return Ok(None) };
+        drop(docs);
+
+        let path = match uri.to_file_path() { Ok(p) => p, Err(()) => return Ok(None) };
+        let mod_root = Self::find_mod_root(&path);
+        let defs = self.mod_definitions.read().await;
+        let definitions = mod_root.as_ref().and_then(|r| defs.get(r));
+
+        let start_line = params.range.start.line;
+        let end_line = params.range.end.line;
+        let data = build_semantic_tokens_range(&text, definitions, start_line, end_line);
+        if data.is_empty() { return Ok(None); }
+        Ok(Some(SemanticTokensRangeResult::Tokens(SemanticTokens { result_id: None, data })))
+    }
+
     // ─── Call Hierarchy ──────────────────────────────────────────────────────
 
     async fn prepare_call_hierarchy(
@@ -1603,6 +1624,23 @@ fn build_semantic_tokens(
     text: &str,
     definitions: Option<&HashMap<String, (Location, String)>>,
 ) -> Vec<SemanticToken> {
+    build_semantic_tokens_impl(text, definitions, None)
+}
+
+fn build_semantic_tokens_range(
+    text: &str,
+    definitions: Option<&HashMap<String, (Location, String)>>,
+    start_line: u32,
+    end_line: u32,
+) -> Vec<SemanticToken> {
+    build_semantic_tokens_impl(text, definitions, Some((start_line, end_line)))
+}
+
+fn build_semantic_tokens_impl(
+    text: &str,
+    definitions: Option<&HashMap<String, (Location, String)>>,
+    line_range: Option<(u32, u32)>,
+) -> Vec<SemanticToken> {
     use std::sync::OnceLock;
     use tiger_lib::all_builtin_entries;
 
@@ -1621,6 +1659,10 @@ fn build_semantic_tokens(
 
     for (li, line) in text.lines().enumerate() {
         let li = li as u32;
+        if let Some((start, end)) = line_range {
+            if li < start { continue; }
+            if li > end { break; }
+        }
         let trimmed = line.trim_start();
 
         // Whole-line comment.
