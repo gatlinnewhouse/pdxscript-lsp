@@ -314,9 +314,9 @@ fn extract_children(
                         }
                     }
                 }
-                c if !in_string && !c.is_whitespace() => {
+                ch if !in_string && !ch.is_whitespace() => {
                     if depth == 0 && child_start.is_none() {
-                        child_start = Some((l, c as usize));
+                        child_start = Some((l, c));
                     }
                 }
                 _ => {}
@@ -332,7 +332,7 @@ fn extract_children(
                 } else {
                     line
                 };
-                if seg[start.1..].trim_end().len() > 0 {
+                if start.1 <= seg.len() && seg[start.1..].trim_end().len() > 0 {
                     children.push((start.0, start.1, l, col_to.saturating_sub(1)));
                 }
             }
@@ -345,13 +345,20 @@ fn extract_children(
 /// Collect the text of a child span as a single trimmed string.
 fn child_text(lines: &[&str], sl: usize, sc: usize, el: usize, ec: usize) -> String {
     if sl == el {
-        return lines[sl][sc..=ec.min(lines[sl].len().saturating_sub(1))].trim().to_owned();
+        let line = lines[sl];
+        let sc = sc.min(line.len());
+        let ec = ec.min(line.len().saturating_sub(1));
+        return if sc <= ec { line[sc..=ec].trim().to_owned() } else { String::new() };
     }
-    let mut parts = vec![lines[sl][sc..].trim_end().to_owned()];
+    let first = lines[sl];
+    let sc = sc.min(first.len());
+    let mut parts = vec![first[sc..].trim_end().to_owned()];
     for l in (sl + 1)..el {
         parts.push(lines[l].trim().to_owned());
     }
-    parts.push(lines[el][..=ec.min(lines[el].len().saturating_sub(1))].trim().to_owned());
+    let last = lines[el];
+    let ec = ec.min(last.len().saturating_sub(1));
+    parts.push(last[..=ec].trim().to_owned());
     parts.join("\n")
 }
 
