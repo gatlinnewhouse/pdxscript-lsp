@@ -1048,18 +1048,18 @@ checksum = "5be167a7af36ee22fe3115051bc51f6e6c7054c9348e28deb4f49bd6f705a315"
 
 [[package]]
 name = "pin-project"
-version = "1.1.11"
+version = "1.1.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f1749c7ed4bcaf4c3d0a3efc28538844fb29bcdd7d2b67b2be7e20ba861ff517"
+checksum = "cbf0d9e68100b3a7989b4901972f265cd542e560a3a8a724e1e20322f4d06ce9"
 dependencies = [
  "pin-project-internal",
 ]
 
 [[package]]
 name = "pin-project-internal"
-version = "1.1.11"
+version = "1.1.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d9b20ed30f105399776b9c883e68e536ef602a16ae6f596d2c473591d6ad64c6"
+checksum = "a990e22f43e84855daf260dded30524ef4a9021cc7541c26540500a50b624389"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1337,9 +1337,9 @@ checksum = "703d5c7ef118737c72f1af64ad2f6f8c5e1921f818cdcb97b8fe6fc69bf66214"
 
 [[package]]
 name = "siphasher"
-version = "1.0.2"
+version = "1.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b2aa850e253778c88a04c3d7323b043aeda9d3e30d5971937c1855769763678e"
+checksum = "8ee5873ec9cce0195efcb7a4e9507a04cd49aec9c83d0389df45b1ef7ba2e649"
 
 [[package]]
 name = "slab"
@@ -1491,7 +1491,7 @@ dependencies = [
 [[package]]
 name = "tiger-lib"
 version = "1.18.0"
-source = "git+https://github.com/gatlinnewhouse/tiger?branch=lsp_wip#8f3435a3165ad2e68251c9df9eca02e9cae6d4e3"
+source = "git+https://github.com/gatlinnewhouse/tiger?branch=lsp_wip#9b655afb9cc6079640027ae1a37cb2ffb8ab394e"
 dependencies = [
  "ahash",
  "ansiterm",
@@ -1528,7 +1528,7 @@ dependencies = [
 [[package]]
 name = "tiger-tables"
 version = "1.18.0"
-source = "git+https://github.com/gatlinnewhouse/tiger?branch=lsp_wip#8f3435a3165ad2e68251c9df9eca02e9cae6d4e3"
+source = "git+https://github.com/gatlinnewhouse/tiger?branch=lsp_wip#9b655afb9cc6079640027ae1a37cb2ffb8ab394e"
 dependencies = [
  "anyhow",
  "phf",
@@ -1588,9 +1588,9 @@ dependencies = [
 
 [[package]]
 name = "tokio"
-version = "1.52.1"
+version = "1.52.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b67dee974fe86fd92cc45b7a95fdd2f99a36a6d7b0d431a231178d3d670bbcc6"
+checksum = "110a78583f19d5cdb2c5ccf321d1290344e71313c6c37d43520d386027d18386"
 dependencies = [
  "bytes",
  "libc",
