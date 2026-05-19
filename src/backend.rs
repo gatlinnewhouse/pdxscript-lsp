@@ -50,6 +50,8 @@ pub struct Backend {
     mod_definitions: RwLock<HashMap<PathBuf, HashMap<String, (Location, String)>>>,
     /// HOI4 flag names collected from set_*_flag effects, per mod root.
     mod_flags: RwLock<HashMap<PathBuf, Vec<String>>>,
+    /// Game item names keyed by (mod root, subdir), used for fast value completions.
+    mod_game_items: RwLock<HashMap<PathBuf, Vec<(String, String)>>>,
     /// Scope inlay hints per file URI, collected from tiger-lib scope annotations.
     inlay_hints: RwLock<HintMap>,
 }
@@ -65,6 +67,7 @@ impl Backend {
             mod_completions: RwLock::new(HashMap::new()),
             mod_definitions: RwLock::new(HashMap::new()),
             mod_flags: RwLock::new(HashMap::new()),
+            mod_game_items: RwLock::new(HashMap::new()),
             inlay_hints: RwLock::new(HashMap::new()),
         }
     }
@@ -138,8 +141,18 @@ impl Backend {
 
         match result {
             Ok(Ok((diag_map, hint_map))) => {
-                // Merge new hints into global store (replace entries for affected files).
-                self.inlay_hints.write().await.extend(hint_map);
+                // Drop stale hints for files under this mod root before inserting fresh ones,
+                // so deleted files or files that lost all annotations don't persist forever.
+                {
+                    let mut hints = self.inlay_hints.write().await;
+                    hints.retain(|uri, _| {
+                        uri.to_file_path()
+                            .ok()
+                            .and_then(|p| Self::find_mod_root(&p))
+                            .map_or(true, |root| root != mod_root)
+                    });
+                    hints.extend(hint_map);
+                }
                 self.publish_tiger_diagnostics(diag_map).await;
                 self.refresh_mod_index(mod_root).await;
             }
@@ -167,12 +180,14 @@ impl Backend {
 
         let raw_defs = scan.definitions.clone();
         let flags = scan.flags.clone();
+        let game_items = scan.game_items.clone();
         let completions = scan.into_completion_items();
         let definitions = defs_to_locations(raw_defs);
 
         self.mod_completions.write().await.insert(mod_root.clone(), completions);
         self.mod_definitions.write().await.insert(mod_root.clone(), definitions);
-        self.mod_flags.write().await.insert(mod_root, flags);
+        self.mod_flags.write().await.insert(mod_root.clone(), flags);
+        self.mod_game_items.write().await.insert(mod_root, game_items);
     }
 
     async fn publish_tiger_diagnostics(&self, mut new_map: DiagMap) {
@@ -904,19 +919,11 @@ impl LanguageServer for Backend {
                     .next()
                     .unwrap_or(item_path);
                 if !subdir_expected.is_empty() {
-                    let mod_root = Self::find_mod_root(&path);
-                    if let Some(root) = mod_root {
-                        let cfg = self.build_validate_config().await;
-                        let game_dir = cfg.as_ref().map(|c| c.game_dir.clone());
-                        let workshop_dir = cfg.as_ref().and_then(|c| c.workshop_dir.clone());
+                    if let Some(root) = Self::find_mod_root(&path) {
                         let expected = subdir_expected.to_owned();
-                        if let Ok(scan) = tokio::task::spawn_blocking(move || {
-                            scan_mod_items(&root, game_dir.as_deref(), workshop_dir.as_deref())
-                        })
-                        .await
-                        {
-                            let filtered: Vec<CompletionItem> = scan.game_items
-                                .into_iter()
+                        if let Some(cached) = self.mod_game_items.read().await.get(&root) {
+                            let filtered: Vec<CompletionItem> = cached
+                                .iter()
                                 .filter(|(_, subdir)| *subdir == expected)
                                 .map(|(name, subdir)| CompletionItem {
                                     label: name.clone(),
@@ -926,7 +933,7 @@ impl LanguageServer for Backend {
                                         detail: Some(format!(" {subdir}")),
                                         description: None,
                                     }),
-                                    insert_text: Some(name),
+                                    insert_text: Some(name.clone()),
                                     insert_text_format: Some(InsertTextFormat::PLAIN_TEXT),
                                     ..Default::default()
                                 })
@@ -1096,11 +1103,13 @@ impl LanguageServer for Backend {
                 {
                     let raw_defs = scan.definitions.clone();
                     let flags = scan.flags.clone();
+                    let game_items = scan.game_items.clone();
                     let scanned = scan.into_completion_items();
                     let definitions = defs_to_locations(raw_defs);
                     self.mod_completions.write().await.insert(mod_root.clone(), scanned.clone());
                     self.mod_definitions.write().await.insert(mod_root.clone(), definitions);
                     self.mod_flags.write().await.insert(mod_root.clone(), flags);
+                    self.mod_game_items.write().await.insert(mod_root.clone(), game_items);
                     items.extend(scanned);
                 }
             }

@@ -51,4 +51,4 @@ url = "2"
 steamlocate = "2.0"
 home = "0.5"
 
-tiger-lib = { git = "https://github.com/gatlinnewhouse/tiger", branch = "lsp_wip", default-features = false }
+tiger-lib = { path = "../tiger", default-features = false }

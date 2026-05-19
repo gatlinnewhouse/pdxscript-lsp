@@ -15,7 +15,7 @@ use tiger_lib::ModMetadata;
 use tiger_lib::ModFile;
 use tiger_lib::{
     Confidence, Everything, LspAnnotationKind, Severity,
-    set_lsp_mode, take_annotations, take_reports,
+    reset_for_lsp_run, set_lsp_mode, take_annotations, take_reports,
 };
 use tower_lsp::lsp_types::{
     Diagnostic, DiagnosticSeverity, InlayHint, InlayHintKind, InlayHintLabel,
@@ -48,6 +48,10 @@ pub fn validate_mod(mod_root: &Path, cfg: &ValidateConfig) -> Result<(DiagMap, H
     let _lock = VALIDATION_LOCK
         .lock()
         .unwrap_or_else(|e| e.into_inner());
+
+    // Reset all tiger global state from the previous run (bump allocator, path table, error
+    // cache, etc.) so memory from previous validations is fully reclaimed before we start.
+    reset_for_lsp_run();
 
     // vic3 and eu5 use a metadata folder; ck3/imperator/hoi4 use a .mod file.
     #[cfg(any(feature = "vic3", feature = "eu5"))]
