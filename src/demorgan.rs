@@ -3,9 +3,9 @@
 //! Detects `NOT = { AND/OR = { ... } }` and rewrites to
 //! `AND/OR = { NOT = { ... } ... }`.
 
-use tower_lsp::lsp_types::{
+use tower_lsp_server::ls_types::{
     CodeAction, CodeActionKind, CodeActionOrCommand, Diagnostic, DiagnosticSeverity,
-    NumberOrString, Position, Range, TextEdit, Url, WorkspaceEdit,
+    NumberOrString, Position, Range, TextEdit, Uri, WorkspaceEdit,
 };
 
 use std::collections::HashMap;
@@ -126,7 +126,7 @@ pub fn violations_to_diagnostics(violations: &[Violation]) -> Vec<Diagnostic> {
 
 /// Build a code action for `violation` that produces a `WorkspaceEdit`.
 pub fn violation_to_action(
-    uri: &Url,
+    uri: &Uri,
     lines: &[&str],
     violation: &Violation,
 ) -> CodeActionOrCommand {
@@ -363,7 +363,7 @@ fn child_text(lines: &[&str], sl: usize, sc: usize, el: usize, ec: usize) -> Str
 }
 
 /// Build the `WorkspaceEdit` for a violation.
-fn build_edit(uri: &Url, lines: &[&str], v: &Violation) -> WorkspaceEdit {
+fn build_edit(uri: &Uri, lines: &[&str], v: &Violation) -> WorkspaceEdit {
     let indent = {
         let not_line = lines[v.not_line as usize];
         let spaces = not_line.len() - not_line.trim_start().len();
@@ -483,7 +483,7 @@ mod tests {
         let ls = lines(script);
         let vs = find_violations(&ls);
         assert!(!vs.is_empty(), "no violations found in: {script}");
-        let uri = Url::parse("file:///test.txt").unwrap();
+        let uri = "file:///test.txt".parse::<Uri>().unwrap();
         let action = violation_to_action(&uri, &ls, &vs[0]);
         match action {
             CodeActionOrCommand::CodeAction(ca) => {

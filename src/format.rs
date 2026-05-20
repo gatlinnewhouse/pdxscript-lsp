@@ -1,6 +1,6 @@
 //! LSP document formatting — port of pdxscript.nvim's format_lines.
 
-use tower_lsp::lsp_types::{Position, Range, TextEdit};
+use tower_lsp_server::ls_types::{Position, Range, TextEdit};
 
 /// Return a whole-document TextEdit if the text needs reformatting, else None.
 pub fn format_document(text: &str) -> Option<Vec<TextEdit>> {

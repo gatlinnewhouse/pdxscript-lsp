@@ -1,6 +1,6 @@
 //! Folding ranges from brace structure.
 
-use tower_lsp::lsp_types::{FoldingRange, FoldingRangeKind};
+use tower_lsp_server::ls_types::{FoldingRange, FoldingRangeKind};
 
 pub fn folding_ranges(text: &str) -> Vec<FoldingRange> {
     let mut ranges = Vec::new();

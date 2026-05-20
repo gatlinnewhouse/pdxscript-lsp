@@ -4,13 +4,13 @@ use std::collections::HashMap;
 use std::fs;
 
 use tiger_lib::{LspEntryKind, all_builtin_entries};
-use tower_lsp::lsp_types::{Hover, HoverContents, Location, MarkupContent, MarkupKind};
+use tower_lsp_server::ls_types::{Hover, HoverContents, Location, MarkupContent, MarkupKind};
 
 use crate::wiki;
 
 /// Hover for a scripted item — shows the first 20 lines of its definition.
 pub fn hover_scripted(name: &str, detail: &str, loc: &Location) -> Option<Hover> {
-    let path = loc.uri.to_file_path().ok()?;
+    let path = loc.uri.to_file_path()?;
     let text = fs::read_to_string(path).ok()?;
     let start = loc.range.start.line as usize;
 

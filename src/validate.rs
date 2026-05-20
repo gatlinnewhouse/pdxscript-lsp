@@ -17,19 +17,19 @@ use tiger_lib::{
     Confidence, Everything, LspAnnotationKind, Severity,
     reset_for_lsp_run, set_lsp_mode, take_annotations, take_reports,
 };
-use tower_lsp::lsp_types::{
+use tower_lsp_server::ls_types::{
     Diagnostic, DiagnosticSeverity, InlayHint, InlayHintKind, InlayHintLabel,
-    NumberOrString, Position, Range, Url,
+    NumberOrString, Position, Range, Uri,
 };
 
 /// Serializes all validation runs — tiger-lib ERRORS is a global static.
 static VALIDATION_LOCK: Mutex<()> = Mutex::new(());
 
 /// Per-file diagnostics keyed by absolute path URI.
-pub type DiagMap = HashMap<Url, Vec<Diagnostic>>;
+pub type DiagMap = HashMap<Uri, Vec<Diagnostic>>;
 
 /// Per-file inlay hints collected from tiger-lib scope annotations.
-pub type HintMap = HashMap<Url, Vec<InlayHint>>;
+pub type HintMap = HashMap<Uri, Vec<InlayHint>>;
 
 /// Configuration paths needed to run validation.
 #[derive(Debug, Clone)]
@@ -159,8 +159,8 @@ pub fn validate_mod(mod_root: &Path, cfg: &ValidateConfig) -> Result<(DiagMap, H
                         let uri = path_to_uri(p.loc.fullpath()).ok()?;
                         let range = loc_to_range(p.loc.line, p.loc.column, p.length);
                         let msg = p.msg.clone().unwrap_or_else(|| "related".to_owned());
-                        Some(tower_lsp::lsp_types::DiagnosticRelatedInformation {
-                            location: tower_lsp::lsp_types::Location { uri, range },
+                        Some(tower_lsp_server::ls_types::DiagnosticRelatedInformation {
+                            location: tower_lsp_server::ls_types::Location { uri, range },
                             message: msg,
                         })
                     })
@@ -222,8 +222,8 @@ pub fn validate_mod(mod_root: &Path, cfg: &ValidateConfig) -> Result<(DiagMap, H
     Ok((map, hint_map))
 }
 
-fn path_to_uri(path: &Path) -> Result<Url> {
-    Ok(Url::from_file_path(path).map_err(|()| anyhow::anyhow!("bad path: {}", path.display()))?)
+fn path_to_uri(path: &Path) -> Result<Uri> {
+    Uri::from_file_path(path).ok_or_else(|| anyhow::anyhow!("bad path: {}", path.display()))
 }
 
 /// Convert 1-based (line, column) + length to a zero-based LSP `Range`.

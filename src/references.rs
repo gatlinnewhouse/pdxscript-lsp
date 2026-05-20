@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 
-use tower_lsp::lsp_types::{Location, Position, Range, TextEdit, Url, WorkspaceEdit};
+use tower_lsp_server::ls_types::{Location, Position, Range, TextEdit, Uri, WorkspaceEdit};
 
 /// Find all file locations where `name` appears as a whole token.
 /// `roots` should include the mod dir, dependency dirs, and optionally the game dir.
@@ -27,13 +27,13 @@ fn scan_dir(name: &str, dir: &Path, out: &mut Vec<Location>) {
             Some("txt") | Some("gui")
         ) {
             let Ok(text) = fs::read_to_string(&path) else { continue };
-            let Ok(uri) = Url::from_file_path(&path) else { continue };
+            let Some(uri) = Uri::from_file_path(&path) else { continue };
             collect_occurrences(name, &text, uri, out);
         }
     }
 }
 
-fn collect_occurrences(name: &str, text: &str, uri: Url, out: &mut Vec<Location>) {
+fn collect_occurrences(name: &str, text: &str, uri: Uri, out: &mut Vec<Location>) {
     let nlen = name.len();
     for (line_idx, line) in text.lines().enumerate() {
         // Skip comments
@@ -64,7 +64,7 @@ fn collect_occurrences(name: &str, text: &str, uri: Url, out: &mut Vec<Location>
 
 /// Build a WorkspaceEdit that replaces every reference to `old_name` with `new_name`.
 pub fn rename_edit(refs: &[Location], new_name: &str) -> WorkspaceEdit {
-    let mut changes: HashMap<Url, Vec<TextEdit>> = HashMap::new();
+    let mut changes: HashMap<Uri, Vec<TextEdit>> = HashMap::new();
     for loc in refs {
         changes
             .entry(loc.uri.clone())
@@ -77,10 +77,10 @@ pub fn rename_edit(refs: &[Location], new_name: &str) -> WorkspaceEdit {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tower_lsp::lsp_types::Url;
+    use tower_lsp_server::ls_types::Uri;
 
-    fn fake_uri() -> Url {
-        Url::parse("file:///tmp/test.txt").unwrap()
+    fn fake_uri() -> Uri {
+        "file:///tmp/test.txt".parse::<Uri>().unwrap()
     }
 
     fn occurrences(name: &str, text: &str) -> Vec<Location> {

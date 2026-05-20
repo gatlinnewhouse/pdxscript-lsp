@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use tower_lsp::lsp_types::{
+use tower_lsp_server::ls_types::{
     CallHierarchyIncomingCall, CallHierarchyIncomingCallsParams, CallHierarchyItem,
     CallHierarchyOutgoingCall, CallHierarchyOutgoingCallsParams, CallHierarchyPrepareParams,
     Location, Position, Range, SymbolKind,
@@ -67,8 +67,8 @@ pub fn incoming_calls(
         }
 
         let file_path = match loc.uri.to_file_path() {
-            Ok(p) => p,
-            Err(_) => continue,
+            Some(p) => p.into_owned(),
+            None => continue,
         };
         let text = match std::fs::read_to_string(&file_path) {
             Ok(t) => t,
@@ -82,7 +82,7 @@ pub fn incoming_calls(
             None => continue, // reference is not inside any named block — skip
         };
 
-        let key = format!("{}#{}", loc.uri, caller_name);
+        let key = format!("{}#{}", loc.uri.as_str(), caller_name);
         let entry = caller_map.entry(key).or_insert_with(|| {
             // Try to get the definition location of the caller for richer info.
             let caller_item = if let Some((caller_loc, detail)) = definitions.get(&caller_name) {

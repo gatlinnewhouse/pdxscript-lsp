@@ -11,7 +11,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use tiger_lib::{LspEntryKind, all_builtin_entries, scope_chain_entries};
-use tower_lsp::lsp_types::{
+use tower_lsp_server::ls_types::{
     CompletionItem, CompletionItemKind, CompletionItemLabelDetails, InsertTextFormat,
 };
 

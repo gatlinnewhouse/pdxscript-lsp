@@ -2,8 +2,8 @@
 
 use std::collections::HashMap;
 
-use tower_lsp::lsp_types::{
-    DocumentSymbol, Location, Position, Range, SymbolInformation, SymbolKind, Url,
+use tower_lsp_server::ls_types::{
+    DocumentSymbol, Location, Position, Range, SymbolInformation, SymbolKind, Uri,
 };
 
 /// Map a scan-time detail string (from `scan_mod_items`) to a SymbolKind.
@@ -95,6 +95,7 @@ pub fn document_symbols(text: &str, file_kind: SymbolKind) -> Vec<DocumentSymbol
                             } else {
                                 file_kind
                             };
+                            #[allow(deprecated)]
                             symbols.push(DocumentSymbol {
                                 name: name.clone(),
                                 kind,
@@ -204,7 +205,7 @@ pub fn defs_to_locations(
 ) -> HashMap<String, (Location, String)> {
     raw.into_iter()
         .filter_map(|(name, (path, line, detail))| {
-            let uri = Url::from_file_path(&path).ok()?;
+            let uri = Uri::from_file_path(&path)?;
             let l = line.saturating_sub(1); // 1-based → 0-based
             let range = Range {
                 start: Position { line: l, character: 0 },

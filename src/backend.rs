@@ -5,10 +5,10 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 use tokio::sync::{Mutex, RwLock};
-use tower_lsp::jsonrpc::Result as LspResult;
-use tower_lsp::lsp_types::request::{GotoDeclarationParams, GotoDeclarationResponse};
-use tower_lsp::lsp_types::*;
-use tower_lsp::{Client, LanguageServer};
+use tower_lsp_server::jsonrpc::Result as LspResult;
+use tower_lsp_server::ls_types::request::{GotoDeclarationParams, GotoDeclarationResponse};
+use tower_lsp_server::ls_types::*;
+use tower_lsp_server::{Client, LanguageServer};
 
 use crate::completions::{
     builtin_completions, detail_hint_from_path, document_top_level_completions,
@@ -41,8 +41,8 @@ pub struct Backend {
     client: Client,
     settings: RwLock<Settings>,
     validation_semaphore: tokio::sync::Semaphore,
-    published: Mutex<HashMap<Url, Vec<Diagnostic>>>,
-    documents: RwLock<HashMap<Url, String>>,
+    published: Mutex<HashMap<Uri, Vec<Diagnostic>>>,
+    documents: RwLock<HashMap<Uri, String>>,
     /// Completion items per mod root (tier 3).
     mod_completions: RwLock<HashMap<PathBuf, Vec<CompletionItem>>>,
     /// Definition locations + detail for scripted items per mod root.
@@ -104,11 +104,11 @@ impl Backend {
         }
     }
 
-    async fn run_validation(&self, file_uri: &Url) {
+    async fn run_validation(&self, file_uri: &Uri) {
         let path = match file_uri.to_file_path() {
-            Ok(p) => p,
-            Err(()) => {
-                tracing::warn!("Cannot convert URI to path: {file_uri}");
+            Some(p) => p.into_owned(),
+            None => {
+                tracing::warn!("Cannot convert URI to path: {}", file_uri.as_str());
                 return;
             }
         };
@@ -147,8 +147,7 @@ impl Backend {
                     let mut hints = self.inlay_hints.write().await;
                     hints.retain(|uri, _| {
                         uri.to_file_path()
-                            .ok()
-                            .and_then(|p| Self::find_mod_root(&p))
+                            .and_then(|p| Self::find_mod_root(p.as_ref()))
                             .map_or(true, |root| root != mod_root)
                     });
                     hints.extend(hint_map);
@@ -209,7 +208,7 @@ impl Backend {
         *published = new_map.into_iter().filter(|(_, v)| !v.is_empty()).collect();
     }
 
-    async fn publish_demorgan(&self, uri: &Url, text: &str) {
+    async fn publish_demorgan(&self, uri: &Uri, text: &str) {
         let lines: Vec<&str> = text.lines().collect();
         let violations = find_violations(&lines);
         let mut diags = violations_to_diagnostics(&violations);
@@ -327,7 +326,6 @@ fn extract_conf_value(line: &str, key: &str) -> Option<String> {
     if val.is_empty() { None } else { Some(val.to_owned()) }
 }
 
-#[tower_lsp::async_trait]
 impl LanguageServer for Backend {
     async fn initialize(&self, params: InitializeParams) -> LspResult<InitializeResult> {
         if let Some(opts) = params.initialization_options {
@@ -422,6 +420,7 @@ impl LanguageServer for Backend {
                 name: "pdxscript-lsp".to_owned(),
                 version: Some(env!("CARGO_PKG_VERSION").to_owned()),
             }),
+            offset_encoding: None,
         })
     }
 
@@ -510,7 +509,7 @@ impl LanguageServer for Backend {
             }
         }
 
-        let path = match uri.to_file_path() { Ok(p) => p, Err(()) => return Ok(None) };
+        let path = match uri.to_file_path() { Some(p) => p.into_owned(), None => return Ok(None) };
         if let Some(mod_root) = Self::find_mod_root(&path) {
             let defs = self.mod_definitions.read().await;
             if let Some(definitions) = defs.get(&mod_root) {
@@ -563,7 +562,7 @@ impl LanguageServer for Backend {
         let (word, _, _) = match word_at(line, pos.character as usize) { Some(w) => w, None => return Ok(None) };
         drop(docs);
 
-        let path = match uri.to_file_path() { Ok(p) => p, Err(()) => return Ok(None) };
+        let path = match uri.to_file_path() { Some(p) => p.into_owned(), None => return Ok(None) };
         if let Some(mod_root) = Self::find_mod_root(&path) {
             let defs = self.mod_definitions.read().await;
             if let Some(definitions) = defs.get(&mod_root) {
@@ -609,7 +608,7 @@ impl LanguageServer for Backend {
         let (word, _, _) = match word_at(line, pos.character as usize) { Some(w) => w, None => return Ok(None) };
         drop(docs);
 
-        let path = match uri.to_file_path() { Ok(p) => p, Err(()) => return Ok(None) };
+        let path = match uri.to_file_path() { Some(p) => p.into_owned(), None => return Ok(None) };
         let mod_root = match Self::find_mod_root(&path) { Some(r) => r, None => return Ok(None) };
         let roots = self.search_roots(&mod_root).await;
         let root_refs: Vec<&Path> = roots.iter().map(PathBuf::as_path).collect();
@@ -656,7 +655,7 @@ impl LanguageServer for Backend {
         let (word, _, _) = match word_at(line, pos.character as usize) { Some(w) => w, None => return Ok(None) };
         drop(docs);
 
-        let path = match uri.to_file_path() { Ok(p) => p, Err(()) => return Ok(None) };
+        let path = match uri.to_file_path() { Some(p) => p.into_owned(), None => return Ok(None) };
         let mod_root = match Self::find_mod_root(&path) { Some(r) => r, None => return Ok(None) };
         let roots = self.search_roots(&mod_root).await;
 
@@ -743,8 +742,8 @@ impl LanguageServer for Backend {
         let text = match docs.get(uri) { Some(t) => t.clone(), None => return Ok(None) };
         drop(docs);
         let file_kind = uri.to_file_path()
-            .map(|p| kind_from_path(&p))
-            .unwrap_or(tower_lsp::lsp_types::SymbolKind::OBJECT);
+            .map(|p| kind_from_path(p.as_ref()))
+            .unwrap_or(SymbolKind::OBJECT);
         let syms = document_symbols(&text, file_kind);
         if syms.is_empty() {
             Ok(None)
@@ -758,7 +757,7 @@ impl LanguageServer for Backend {
     async fn symbol(
         &self,
         params: WorkspaceSymbolParams,
-    ) -> LspResult<Option<Vec<SymbolInformation>>> {
+    ) -> LspResult<Option<WorkspaceSymbolResponse>> {
         let query = &params.query;
         // Merge definitions from all known mod roots.
         let all_defs = self.mod_definitions.read().await;
@@ -770,7 +769,7 @@ impl LanguageServer for Backend {
         }
         drop(all_defs);
         let syms = workspace_symbols(query, &merged);
-        if syms.is_empty() { Ok(None) } else { Ok(Some(syms)) }
+        if syms.is_empty() { Ok(None) } else { Ok(Some(WorkspaceSymbolResponse::Flat(syms))) }
     }
 
     // ─── Folding Ranges ──────────────────────────────────────────────────────
@@ -804,7 +803,7 @@ impl LanguageServer for Backend {
 
     async fn completion(&self, params: CompletionParams) -> LspResult<Option<CompletionResponse>> {
         let uri = &params.text_document_position.text_document.uri;
-        let path = match uri.to_file_path() { Ok(p) => p, Err(()) => return Ok(None) };
+        let path = match uri.to_file_path() { Some(p) => p.into_owned(), None => return Ok(None) };
 
         let trigger = params.context.as_ref()
             .and_then(|c| c.trigger_character.as_deref());
@@ -861,12 +860,12 @@ impl LanguageServer for Backend {
                             if item.detail.as_deref() == Some("@variable") {
                                 // Strip the leading '@' from the label.
                                 let bare = item.label.trim_start_matches('@').to_owned();
-                                items.push(tower_lsp::lsp_types::CompletionItem {
+                                items.push(CompletionItem {
                                     label: bare.clone(),
-                                    kind: Some(tower_lsp::lsp_types::CompletionItemKind::VARIABLE),
+                                    kind: Some(CompletionItemKind::VARIABLE),
                                     detail: Some("@variable (expr)".to_owned()),
                                     insert_text: Some(bare),
-                                    insert_text_format: Some(tower_lsp::lsp_types::InsertTextFormat::PLAIN_TEXT),
+                                    insert_text_format: Some(InsertTextFormat::PLAIN_TEXT),
                                     ..Default::default()
                                 });
                             }
@@ -877,12 +876,12 @@ impl LanguageServer for Backend {
                     if let Some(text) = docs.get(uri) {
                         for item in crate::completions::variable_completions(text) {
                             let bare = item.label.trim_start_matches('@').to_owned();
-                            items.push(tower_lsp::lsp_types::CompletionItem {
+                            items.push(CompletionItem {
                                 label: bare.clone(),
-                                kind: Some(tower_lsp::lsp_types::CompletionItemKind::VARIABLE),
+                                kind: Some(CompletionItemKind::VARIABLE),
                                 detail: Some("@variable (expr)".to_owned()),
                                 insert_text: Some(bare),
-                                insert_text_format: Some(tower_lsp::lsp_types::InsertTextFormat::PLAIN_TEXT),
+                                insert_text_format: Some(InsertTextFormat::PLAIN_TEXT),
                                 ..Default::default()
                             });
                         }
@@ -1205,7 +1204,7 @@ impl LanguageServer for Backend {
         drop(docs);
 
         // Find all occurrences in this document only.
-        let path = match uri.to_file_path() { Ok(p) => p, Err(()) => return Ok(None) };
+        let path = match uri.to_file_path() { Some(p) => p.into_owned(), None => return Ok(None) };
         let locs = crate::references::find_references(&word, &[&path]);
         if locs.is_empty() { return Ok(None); }
         let highlights = locs.into_iter()
@@ -1236,7 +1235,7 @@ impl LanguageServer for Backend {
                 let end = rest.find(|c: char| c.is_whitespace() || c == ')' || c == '"' || c == '\'')
                     .unwrap_or(rest.len());
                 let url_str = &rest[..end];
-                if let Ok(target) = Url::parse(url_str) {
+                if let Ok(target) = url_str.parse::<Uri>() {
                     let range = Range {
                         start: Position { line: line_idx as u32, character: url_start as u32 },
                         end: Position { line: line_idx as u32, character: (url_start + end) as u32 },
@@ -1284,7 +1283,7 @@ impl LanguageServer for Backend {
         let text = match docs.get(uri) { Some(t) => t.clone(), None => return Ok(None) };
         drop(docs);
 
-        let path = match uri.to_file_path() { Ok(p) => p, Err(()) => return Ok(None) };
+        let path = match uri.to_file_path() { Some(p) => p.into_owned(), None => return Ok(None) };
         let mod_root = match Self::find_mod_root(&path) { Some(r) => r, None => return Ok(None) };
         let defs = self.mod_definitions.read().await;
         let definitions = match defs.get(&mod_root) { Some(d) => d, None => return Ok(None) };
@@ -1364,7 +1363,7 @@ impl LanguageServer for Backend {
         let text = match docs.get(uri) { Some(t) => t.clone(), None => return Ok(None) };
         drop(docs);
 
-        let path = match uri.to_file_path() { Ok(p) => p, Err(()) => return Ok(None) };
+        let path = match uri.to_file_path() { Some(p) => p.into_owned(), None => return Ok(None) };
         let mod_root = Self::find_mod_root(&path);
         let defs = self.mod_definitions.read().await;
         let definitions: Option<&HashMap<String, (Location, String)>> =
@@ -1384,7 +1383,7 @@ impl LanguageServer for Backend {
         let text = match docs.get(uri) { Some(t) => t.clone(), None => return Ok(None) };
         drop(docs);
 
-        let path = match uri.to_file_path() { Ok(p) => p, Err(()) => return Ok(None) };
+        let path = match uri.to_file_path() { Some(p) => p.into_owned(), None => return Ok(None) };
         let mod_root = Self::find_mod_root(&path);
         let defs = self.mod_definitions.read().await;
         let definitions = mod_root.as_ref().and_then(|r| defs.get(r));
@@ -1407,7 +1406,7 @@ impl LanguageServer for Backend {
         let text = match docs.get(uri) { Some(t) => t.clone(), None => return Ok(None) };
         drop(docs);
 
-        let path = match uri.to_file_path() { Ok(p) => p, Err(()) => return Ok(None) };
+        let path = match uri.to_file_path() { Some(p) => p.into_owned(), None => return Ok(None) };
         let mod_root = match Self::find_mod_root(&path) { Some(r) => r, None => return Ok(None) };
         let defs = self.mod_definitions.read().await;
         let definitions = match defs.get(&mod_root) { Some(d) => d.clone(), None => return Ok(None) };
@@ -1421,7 +1420,7 @@ impl LanguageServer for Backend {
         params: CallHierarchyIncomingCallsParams,
     ) -> LspResult<Option<Vec<CallHierarchyIncomingCall>>> {
         let uri = &params.item.uri;
-        let path = match uri.to_file_path() { Ok(p) => p, Err(()) => return Ok(None) };
+        let path = match uri.to_file_path() { Some(p) => p.into_owned(), None => return Ok(None) };
         let mod_root = match Self::find_mod_root(&path) { Some(r) => r, None => return Ok(None) };
         let defs = self.mod_definitions.read().await;
         let definitions = match defs.get(&mod_root) { Some(d) => d.clone(), None => return Ok(None) };
@@ -1446,7 +1445,7 @@ impl LanguageServer for Backend {
         let text = match docs.get(uri) { Some(t) => t.clone(), None => return Ok(None) };
         drop(docs);
 
-        let path = match uri.to_file_path() { Ok(p) => p, Err(()) => return Ok(None) };
+        let path = match uri.to_file_path() { Some(p) => p.into_owned(), None => return Ok(None) };
         let mod_root = match Self::find_mod_root(&path) { Some(r) => r, None => return Ok(None) };
         let defs = self.mod_definitions.read().await;
         let definitions = match defs.get(&mod_root) { Some(d) => d.clone(), None => return Ok(None) };

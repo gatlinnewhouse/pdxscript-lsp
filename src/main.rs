@@ -11,7 +11,7 @@ mod symbols;
 mod validate;
 mod wiki;
 
-use tower_lsp::{LspService, Server};
+use tower_lsp_server::{LspService, Server};
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]

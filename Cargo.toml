@@ -39,7 +39,7 @@ hoi4 = ["tiger-lib/hoi4"]
 eu5 = ["tiger-lib/eu5"]
 
 [dependencies]
-tower-lsp = "0.20"
+tower-lsp-server = "0.23"
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
